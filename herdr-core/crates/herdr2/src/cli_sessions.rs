@@ -115,6 +115,7 @@ pub fn canonical_cli_agent(raw: &str) -> Option<&'static str> {
 
 pub fn cli_agent_display_name(agent: &str) -> &'static str {
     match canonical_cli_agent(agent).unwrap_or(agent) {
+        "all" | "*" => "All CLI Agents",
         "claude" => "Claude Code",
         "codex" => "Codex",
         "agy" => "Antigravity",
@@ -301,15 +302,47 @@ fn matches_any_workspace(candidate_cwd: &str, targets: &[String]) -> bool {
     targets.iter().any(|t| cwd_matches(candidate_cwd, t))
 }
 
+const ALL_DISCOVERY_AGENTS: &[&str] =
+    &["claude", "codex", "agy", "cursor", "zcode", "opencode", "qwen", "gemini", "pi", "omp", "hermes"];
+
+fn discover_single_agent_sessions(
+    home: &Path,
+    state_dir: &Path,
+    agent: &str,
+    targets: &[String],
+    active_sid: Option<&str>,
+) -> Vec<CliSessionSummary> {
+    match agent {
+        "claude" => discover_claude_sessions(home, targets, active_sid),
+        "codex" => discover_codex_sessions(home, targets, active_sid),
+        "agy" => discover_agy_sessions(home, state_dir, targets, active_sid),
+        "cursor" => discover_cursor_sessions(home, targets, active_sid),
+        "zcode" => discover_zcode_sessions(home, state_dir, targets, active_sid),
+        "opencode" => discover_opencode_sessions(home, targets, active_sid),
+        "qwen" => discover_qwen_or_gemini_sessions(home, "qwen", targets, active_sid),
+        "gemini" => discover_qwen_or_gemini_sessions(home, "gemini", targets, active_sid),
+        "pi" => discover_pi_or_omp_sessions(home, "pi", targets, active_sid),
+        "omp" => discover_pi_or_omp_sessions(home, "omp", targets, active_sid),
+        "hermes" => discover_hermes_sessions(home, targets, active_sid),
+        _ => discover_archived_checkpoint_sessions(state_dir, agent, targets, active_sid),
+    }
+}
+
 pub fn list_cli_sessions(
     state_dir: &Path,
     cwd: &str,
     agent: &str,
+    active_agent: Option<&str>,
     active_session_id: Option<&str>,
     limit: Option<usize>,
 ) -> CliSessionListResult {
     let Some(home) = user_home_dir() else {
-        let canon_agent = canonical_cli_agent(agent).unwrap_or(agent).to_string();
+        let trimmed = agent.trim();
+        let canon_agent = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") || trimmed == "*" {
+            "all".to_string()
+        } else {
+            canonical_cli_agent(trimmed).unwrap_or(trimmed).to_string()
+        };
         return CliSessionListResult {
             cwd: normalize_cwd(cwd),
             agent_name: cli_agent_display_name(&canon_agent).to_string(),
@@ -318,7 +351,7 @@ pub fn list_cli_sessions(
             sessions: Vec::new(),
         };
     };
-    list_cli_sessions_in(&home, state_dir, cwd, agent, active_session_id, limit)
+    list_cli_sessions_in(&home, state_dir, cwd, agent, active_agent, active_session_id, limit)
 }
 
 pub fn list_cli_sessions_in(
@@ -326,14 +359,19 @@ pub fn list_cli_sessions_in(
     state_dir: &Path,
     cwd: &str,
     agent: &str,
+    active_agent: Option<&str>,
     active_session_id: Option<&str>,
     limit: Option<usize>,
 ) -> CliSessionListResult {
-    let canon_agent = canonical_cli_agent(agent).unwrap_or(agent.trim()).to_string();
+    let trimmed = agent.trim();
+    let is_all = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") || trimmed == "*";
+    let canon_agent =
+        if is_all { "all".to_string() } else { canonical_cli_agent(trimmed).unwrap_or(trimmed).to_string() };
     let agent_name = cli_agent_display_name(&canon_agent).to_string();
     let norm_cwd = normalize_cwd(cwd);
     let max_items = limit.unwrap_or(DEFAULT_SESSION_LIMIT).clamp(1, MAX_SESSION_LIMIT);
     let active_sid = active_session_id.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let norm_active_agent = active_agent.and_then(canonical_cli_agent);
 
     if norm_cwd.is_empty() || canon_agent.is_empty() {
         return CliSessionListResult {
@@ -346,28 +384,52 @@ pub fn list_cli_sessions_in(
     }
 
     let targets = workspace_candidates(&norm_cwd);
-    let mut sessions = match canon_agent.as_str() {
-        "claude" => discover_claude_sessions(home, &targets, active_sid.as_deref()),
-        "codex" => discover_codex_sessions(home, &targets, active_sid.as_deref()),
-        "agy" => discover_agy_sessions(home, state_dir, &targets, active_sid.as_deref()),
-        "cursor" => discover_cursor_sessions(home, &targets, active_sid.as_deref()),
-        "zcode" => discover_zcode_sessions(home, state_dir, &targets, active_sid.as_deref()),
-        "opencode" => discover_opencode_sessions(home, &targets, active_sid.as_deref()),
-        "qwen" => discover_qwen_or_gemini_sessions(home, "qwen", &targets, active_sid.as_deref()),
-        "gemini" => discover_qwen_or_gemini_sessions(home, "gemini", &targets, active_sid.as_deref()),
-        "pi" => discover_pi_or_omp_sessions(home, "pi", &targets, active_sid.as_deref()),
-        "omp" => discover_pi_or_omp_sessions(home, "omp", &targets, active_sid.as_deref()),
-        "hermes" => discover_hermes_sessions(home, &targets, active_sid.as_deref()),
-        _ => discover_archived_checkpoint_sessions(state_dir, &canon_agent, &targets, active_sid.as_deref()),
+    let mut sessions = if is_all {
+        let mut combined = Vec::new();
+        let mut scanned_agents = HashSet::new();
+        for &ag in ALL_DISCOVERY_AGENTS {
+            scanned_agents.insert(ag.to_string());
+            let sid_for_ag = match norm_active_agent {
+                Some(act) if act == ag => active_sid.as_deref(),
+                None => active_sid.as_deref(),
+                _ => None,
+            };
+            combined.extend(discover_single_agent_sessions(home, state_dir, ag, &targets, sid_for_ag));
+        }
+        if let Ok(entries) = fs::read_dir(state_dir.join("checkpoints").join("sessions")) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    let canon = canonical_cli_agent(name).unwrap_or(name).to_string();
+                    if scanned_agents.insert(canon.clone()) {
+                        let sid_for_ag =
+                            if norm_active_agent == Some(canon.as_str()) { active_sid.as_deref() } else { None };
+                        combined.extend(discover_archived_checkpoint_sessions(state_dir, &canon, &targets, sid_for_ag));
+                    }
+                }
+            }
+        }
+        combined
+    } else {
+        let sid_for_ag = match norm_active_agent {
+            Some(act) if act != canon_agent.as_str() => None,
+            _ => active_sid.as_deref(),
+        };
+        discover_single_agent_sessions(home, state_dir, &canon_agent, &targets, sid_for_ag)
     };
 
-    // Deduplicate by session_id keeping newest updated_ms.
+    // Deduplicate by (agent, session_id) keeping newest updated_ms.
     sessions.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then_with(|| b.created_ms.cmp(&a.created_ms)));
     let mut seen = HashSet::new();
-    sessions.retain(|s| seen.insert(s.session_id.clone()));
+    sessions.retain(|s| seen.insert((s.agent.clone(), s.session_id.clone())));
 
     for s in &mut sessions {
-        s.current = active_sid.as_deref() == Some(s.session_id.as_str());
+        let agent_matches = match norm_active_agent {
+            Some(act) => s.agent == act,
+            None => true,
+        };
+        s.current = agent_matches && active_sid.as_deref() == Some(s.session_id.as_str());
     }
     // Keep current session visible at top if present, otherwise strictly newest-first.
     sessions.sort_by(|a, b| {
@@ -2335,7 +2397,8 @@ mod tests {
         )
         .unwrap();
 
-        let listed_claude = list_cli_sessions_in(&home, &state, &cwd_a, "claude", Some("sid-alpha-1"), None);
+        let listed_claude =
+            list_cli_sessions_in(&home, &state, &cwd_a, "claude", Some("claude"), Some("sid-alpha-1"), None);
         assert_eq!(listed_claude.agent, "claude");
         assert_eq!(listed_claude.agent_name, "Claude Code");
         assert_eq!(listed_claude.sessions.len(), 2);
@@ -2384,7 +2447,7 @@ mod tests {
         )
         .unwrap();
 
-        let listed_codex = list_cli_sessions_in(&home, &state, &cwd_a, "codex", None, None);
+        let listed_codex = list_cli_sessions_in(&home, &state, &cwd_a, "codex", None, None, None);
         assert_eq!(listed_codex.sessions.len(), 1);
         assert_eq!(listed_codex.sessions[0].session_id, "codex-sid-a");
         assert_eq!(listed_codex.sessions[0].title, "Refactor DAG scheduler");
@@ -2408,10 +2471,20 @@ mod tests {
             ),
         )
         .unwrap();
-        let listed_cursor = list_cli_sessions_in(&home, &state, &cwd_a, "cursor", None, None);
+        let listed_cursor = list_cli_sessions_in(&home, &state, &cwd_a, "cursor", None, None, None);
         assert_eq!(listed_cursor.sessions.len(), 1);
         assert_eq!(listed_cursor.sessions[0].title, "Add dark mode toggle");
         assert_eq!(listed_cursor.sessions[0].resume_command, "cursor-agent --yolo --trust --resume cur-sid-9");
+
+        // 4. Unified `all` listing aggregates every CLI agent's sessions for `cwd_a` only.
+        let listed_all = list_cli_sessions_in(&home, &state, &cwd_a, "all", Some("claude"), Some("sid-alpha-1"), None);
+        assert_eq!(listed_all.agent, "all");
+        assert_eq!(listed_all.sessions.len(), 4);
+        assert!(listed_all.sessions[0].current);
+        assert_eq!(listed_all.sessions[0].agent, "claude");
+        assert_eq!(listed_all.sessions[0].session_id, "sid-alpha-1");
+        let agents_seen: HashSet<String> = listed_all.sessions.iter().map(|s| s.agent.clone()).collect();
+        assert_eq!(agents_seen, HashSet::from(["claude".into(), "codex".into(), "cursor".into()]));
 
         let _ = fs::remove_dir_all(&root);
     }

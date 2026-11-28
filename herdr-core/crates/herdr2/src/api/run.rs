@@ -196,10 +196,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         let clear_probe_agent_bg = clear_probe_agent.clone();
         tokio::spawn(async move {
             let mut spec = spec;
-            core_bg
-                .adapters
-                .ensure_for_launch(&core_bg, clear_probe_agent_bg.as_deref(), &spec.argv, &spec.env)
-                .await;
+            core_bg.adapters.ensure_for_launch(&core_bg, clear_probe_agent_bg.as_deref(), &spec.argv, &spec.env).await;
             if let Some((_, effective_argv)) =
                 presets::resolve_acp_command_in_env(clear_probe_agent_bg.as_deref(), &spec.argv, &spec.env)
             {
@@ -577,11 +574,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
     };
     env.insert("H2_DROVE_ACCESS".into(), access_str.into());
     env.insert("H2_DROVE_WORK_CWD".into(), req.cwd.clone());
-    let allowed_json = if req.allowed_paths.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&req.allowed_paths).ok()
-    };
+    let allowed_json = if req.allowed_paths.is_empty() { None } else { serde_json::to_string(&req.allowed_paths).ok() };
     if let Some(ref aj) = allowed_json {
         env.insert("H2_DROVE_ALLOWED_PATHS".into(), aj.clone());
     }

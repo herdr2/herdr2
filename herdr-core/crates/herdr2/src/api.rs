@@ -2420,18 +2420,22 @@ async fn session_list(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or(target_agent)
-        .unwrap_or_default();
+        .or_else(|| target_agent.clone())
+        .unwrap_or_else(|| "all".to_string());
     if cwd.is_empty() {
         return Err(RpcError::invalid_params("session.list requires `cwd` or a valid `target`"));
-    }
-    if agent.is_empty() {
-        return Err(RpcError::invalid_params("session.list requires `agent` or a CLI agent `target`"));
     }
     let state_dir = core.paths.state.clone();
     let limit = p.limit;
     tokio::task::spawn_blocking(move || {
-        crate::cli_sessions::list_cli_sessions(&state_dir, &cwd, &agent, active_sid.as_deref(), limit)
+        crate::cli_sessions::list_cli_sessions(
+            &state_dir,
+            &cwd,
+            &agent,
+            target_agent.as_deref(),
+            active_sid.as_deref(),
+            limit,
+        )
     })
     .await
     .map_err(|e| RpcError::internal(format!("session.list task panicked: {e}")))

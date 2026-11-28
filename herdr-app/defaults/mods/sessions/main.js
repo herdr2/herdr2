@@ -1,5 +1,5 @@
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, v_resizable, resizable_panel, Popup, InputState, Input, Scrollbar } from "gpui-base";
+import { v_flex, h_flex, v_resizable, resizable_panel, InputState, Input, Scrollbar } from "gpui-base";
 import { spaces, panes, focused, terminals, knownAgents, shared, setShared, theme, settings, h2, checking, openOverlay, notify } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
@@ -9,16 +9,12 @@ const KNOWN_AGENTS_KEY = "new-menu.agents";
 const INITIAL_VISIBLE_ITEMS = 60;
 const VISIBLE_ITEMS_STEP = 60;
 const MAX_ENTRY_CHARS = 12000;
-const DEFAULT_SPLIT_TOP_HEIGHT = 220;
+const DEFAULT_SPLIT_TOP_HEIGHT = 224;
 const MIN_SPLIT_TOP_HEIGHT = 96;
 const MAX_SPLIT_TOP_HEIGHT = 680;
+const ALL_SESSION_LIMIT = "120";
 
-const SHELL_NAMES = new Set([
-  "sh", "bash", "zsh", "fish", "nu", "nushell", "dash", "ksh", "csh", "tcsh",
-  "pwsh", "powershell", "cmd", "elvish", "xonsh", "ion",
-]);
-
-// Canonical CLI agents that persist local session history, with fallback display metadata & icons.
+// Canonical CLI agents that persist local session history, with display metadata & icons.
 const BUILTIN_CLI_AGENTS = [
   { key: "claude", name: "Claude Code", icon: "icons/claude.svg", tint: false },
   { key: "codex", name: "Codex", icon: "icons/codex.svg", tint: false },
@@ -41,6 +37,7 @@ const SUPPORTED_AGENT_SET = new Set(BUILTIN_CLI_AGENTS.map((a) => a.key));
 function normalizeAgentKey(raw) {
   const s = String(raw ?? "").trim().toLowerCase().replace(/\.exe$/i, "").replace(/\.real$/i, "");
   if (!s) return null;
+  if (s === "all" || s === "*") return "all";
   if (s === "claude" || s === "claude-code" || s === "claude code") return "claude";
   if (s === "codex" || s === "codex-cli") return "codex";
   if (s === "agy" || s === "antigravity" || s === "antigravity-cli") return "agy";
@@ -90,61 +87,6 @@ function readSavedTopHeight() {
   return DEFAULT_SPLIT_TOP_HEIGHT;
 }
 
-function readPreferredAgent() {
-  try {
-    if (typeof localStorage !== "undefined" && localStorage?.getItem) {
-      const raw = normalizeAgentKey(localStorage.getItem("sessions.preferredAgent"));
-      if (raw) return raw;
-    }
-  } catch {}
-  return null;
-}
-
-function writePreferredAgent(agentKey) {
-  const norm = normalizeAgentKey(agentKey);
-  if (!norm) return;
-  try {
-    if (typeof localStorage !== "undefined" && localStorage?.setItem) {
-      localStorage.setItem("sessions.preferredAgent", norm);
-    }
-  } catch {}
-}
-
-function isGenericProgramKey(key) {
-  const k = String(key ?? "").trim().toLowerCase();
-  return !k || k === "agent" || k === "program" || k === "shell" || k === "terminal" || SHELL_NAMES.has(k);
-}
-
-function detectCliAgentOnPane(pane, term) {
-  if (pane?.program?.agent && !pane?.program?.shell && !isGenericProgramKey(pane.program.key)) {
-    const norm = normalizeAgentKey(pane.program.key);
-    if (norm) return norm;
-  }
-  if (term?.saved_cli?.kind && !isGenericProgramKey(term.saved_cli.kind)) {
-    const norm = normalizeAgentKey(term.saved_cli.kind);
-    if (norm) return norm;
-  }
-  for (const raw of [pane?.app, term?.report?.app]) {
-    if (raw && !isGenericProgramKey(raw)) {
-      const norm = normalizeAgentKey(raw);
-      if (norm) return norm;
-    }
-  }
-  if (term?.program?.agent && !term?.program?.shell && !isGenericProgramKey(term.program.key)) {
-    const norm = normalizeAgentKey(term.program.key);
-    if (norm) return norm;
-  }
-  if (Array.isArray(term?.argv) && term.argv.length > 0) {
-    const first = String(term.argv[0] ?? "").trim();
-    const base = (first.split(/[\\/]/).pop() ?? first).replace(/\.exe$/i, "").toLowerCase();
-    if (base && !SHELL_NAMES.has(base)) {
-      const norm = normalizeAgentKey(base);
-      if (norm) return norm;
-    }
-  }
-  return null;
-}
-
 function resolveActiveTerminalContext() {
   const sList = typeof spaces === "function" ? spaces() : [];
   const pList = typeof panes === "function" ? panes() : [];
@@ -172,8 +114,6 @@ function resolveActiveTerminalContext() {
       return {
         supported: false,
         target: null,
-        detectedAgent: null,
-        isPlainTerminal: false,
         cwd: activeSpace?.folder ?? "",
         machine: activeSpace?.machine ?? null,
         activeSessionId: null,
@@ -209,8 +149,6 @@ function resolveActiveTerminalContext() {
     return {
       supported: Boolean(spaceFolder),
       target: null,
-      detectedAgent: null,
-      isPlainTerminal: true,
       cwd: spaceFolder,
       machine: activeSpace?.machine ?? null,
       activeSessionId: null,
@@ -218,7 +156,6 @@ function resolveActiveTerminalContext() {
     };
   }
 
-  const detectedAgent = detectCliAgentOnPane(chosenPane, term);
   const cwd = String(
     chosenPane?.cwd
       || term?.foreground?.cwd
@@ -233,8 +170,6 @@ function resolveActiveTerminalContext() {
   return {
     supported: true,
     target,
-    detectedAgent,
-    isPlainTerminal: !detectedAgent,
     cwd,
     machine,
     activeSessionId: term?.saved_cli?.session_id ?? null,
@@ -293,7 +228,6 @@ function formatCleanSessionTitle(raw, maxChars = 110) {
     .replace(/\s{2,}/g, " ")
     .trim();
 
-  // Condense verbose handoff preamble if a clear user goal follows it.
   const goalMatch = s.match(/承接上一轮目标继续推进[：:]\s*(.+)$/);
   if (goalMatch && goalMatch[1]?.trim()) {
     s = `${tr("[Handoff] ", "[接力] ")}${goalMatch[1].trim()}`;
@@ -337,10 +271,6 @@ function clipBodyText(raw) {
   return `${s.slice(0, MAX_ENTRY_CHARS)}\n…`;
 }
 
-/**
- * Splits markdown assistant text into prose paragraphs/headings/lists and fenced code cards
- * so responses look clean and readable without raw triple-backtick noise.
- */
 function parseAssistantBlocks(raw) {
   const text = clipBodyText(raw);
   if (!text) return [];
@@ -519,15 +449,16 @@ function formatActivityGroupSummary(group) {
   return parts.length > 0 ? parts.join(" · ") : tr("Steps", "中间步骤");
 }
 
-function buildAgentCatalog(rawKnown) {
+function buildAgentCatalog(rawKnown, presentAgents) {
   const seen = new Set();
   const installedList = [];
-  const fallbackList = [];
+  const extraPresent = [];
+  const presentSet = presentAgents instanceof Set ? presentAgents : new Set();
 
   if (Array.isArray(rawKnown)) {
     for (const item of rawKnown) {
       const norm = normalizeAgentKey(item?.key);
-      if (!norm || seen.has(norm) || !SUPPORTED_AGENT_SET.has(norm)) continue;
+      if (!norm || norm === "all" || seen.has(norm) || !SUPPORTED_AGENT_SET.has(norm)) continue;
       seen.add(norm);
       const builtin = BUILTIN_CLI_AGENTS.find((b) => b.key === norm);
       const entry = {
@@ -538,25 +469,37 @@ function buildAgentCatalog(rawKnown) {
         installed: Boolean(item?.installed),
       };
       if (entry.installed) installedList.push(entry);
-      else fallbackList.push(entry);
+      else if (presentSet.has(norm)) extraPresent.push(entry);
     }
   }
 
   for (const b of BUILTIN_CLI_AGENTS) {
     if (seen.has(b.key)) continue;
     seen.add(b.key);
-    fallbackList.push({ ...b, installed: false });
+    if (presentSet.has(b.key)) {
+      extraPresent.push({ ...b, installed: true });
+    }
   }
 
-  return installedList.length > 0
-    ? [...installedList, ...fallbackList.filter((x) => x.key === "qwen" || x.key === "gemini")]
-    : BUILTIN_CLI_AGENTS.slice(0, 8).map((b) => ({ ...b, installed: true }));
+  if (installedList.length > 0 || extraPresent.length > 0) {
+    return [...installedList, ...extraPresent];
+  }
+  return BUILTIN_CLI_AGENTS.slice(0, 6).map((b) => ({ ...b, installed: true }));
+}
+
+function sessionUniqueKey(s) {
+  if (!s) return "";
+  return `${s.agent || ""}:${s.session_id || ""}`;
 }
 
 export default class Sessions extends View {
   init(_props, cx) {
     this.sessions = [];
-    this.selectedId = null;
+    this.allSessionsCache = [];
+    // Unified across both CLI Agent tabs and plain Terminal tabs:
+    // defaults to `"all"` so every CLI agent type's sessions in the workspace show together.
+    this.agentFilter = "all";
+    this.selectedKey = null;
     this.selectedSession = null;
     this.loadedSessionKey = null;
     this.entries = [];
@@ -564,22 +507,13 @@ export default class Sessions extends View {
     this.expandedGroups = new Set();
     this.expandAllSteps = false;
     this.splitTopHeight = readSavedTopHeight();
-    this.hoveredRowId = null;
-    this.copiedSessionId = null;
+    this.hoveredRowKey = null;
+    this.copiedKey = null;
     this.copiedUntil = 0;
 
-    // Agent selection state:
-    // - On a plain terminal, uses `preferredAgent` (persisted) or first installed CLI agent.
-    // - On a CLI agent tab, follows `detectedAgent` unless user explicitly picked an override for that target.
-    this.preferredAgent = readPreferredAgent();
-    this.manualOverrideByTarget = new Map();
-    this.lastDetectedByTarget = new Map();
-    this.agentPopupOpen = false;
     this.knownByMachine = new Map();
     this.probingMachines = new Set();
 
-    this.agent = null;
-    this.agentName = null;
     this.cwd = null;
     this.loadingList = false;
     this.loadingTranscript = false;
@@ -650,74 +584,55 @@ export default class Sessions extends View {
     const raw = this.knownByMachine.get(mKey)
       ?? (typeof shared === "function" ? shared(KNOWN_AGENTS_KEY)?.[mKey] : null)
       ?? null;
-    return buildAgentCatalog(raw);
+    const present = new Set();
+    for (const s of this.allSessionsCache) {
+      const k = normalizeAgentKey(s?.agent);
+      if (k && k !== "all") present.add(k);
+    }
+    for (const s of this.sessions) {
+      const k = normalizeAgentKey(s?.agent);
+      if (k && k !== "all") present.add(k);
+    }
+    return buildAgentCatalog(raw, present);
   }
 
-  resolveEffectiveAgent(ctx) {
-    const catalog = this.agentCatalogFor(ctx.machine);
-    const targetKey = ctx.target || `space:${ctx.cwd || ""}`;
-
-    // If a terminal transitioned into a different live CLI agent, follow the new live agent automatically.
-    const prevDet = this.lastDetectedByTarget.get(targetKey) ?? null;
-    if (ctx.detectedAgent && ctx.detectedAgent !== prevDet) {
-      this.lastDetectedByTarget.set(targetKey, ctx.detectedAgent);
-      this.manualOverrideByTarget.delete(targetKey);
-    } else if (!ctx.detectedAgent && prevDet) {
-      this.lastDetectedByTarget.delete(targetKey);
-    }
-
-    const manual = this.manualOverrideByTarget.get(targetKey) ?? null;
-    if (manual) return manual;
-
-    if (ctx.detectedAgent) return ctx.detectedAgent;
-
-    if (this.preferredAgent && catalog.some((a) => a.key === this.preferredAgent)) {
-      return this.preferredAgent;
-    }
-    const firstInstalled = catalog.find((a) => a.installed)?.key ?? catalog[0]?.key ?? "claude";
-    return firstInstalled;
-  }
-
-  chooseAgent(agentKey, ctx, cx) {
-    const norm = normalizeAgentKey(agentKey);
-    const targetKey = ctx.target || `space:${ctx.cwd || ""}`;
-    this.agentPopupOpen = false;
-
-    if (!norm) {
-      this.manualOverrideByTarget.delete(targetKey);
-    } else {
-      if (ctx.detectedAgent) {
-        if (norm === ctx.detectedAgent) {
-          this.manualOverrideByTarget.delete(targetKey);
-        } else {
-          this.manualOverrideByTarget.set(targetKey, norm);
-        }
-      } else {
-        this.manualOverrideByTarget.set(targetKey, norm);
-      }
-      this.preferredAgent = norm;
-      writePreferredAgent(norm);
-    }
-
-    this.selectedId = null;
-    this.selectedSession = null;
-    this.loadedSessionKey = null;
-    this.entries = [];
+  chooseAgentFilter(filterKey, cx) {
+    const next = normalizeAgentKey(filterKey) || "all";
+    if (next === this.agentFilter) return;
+    this.agentFilter = next;
+    this.visibleLimit = INITIAL_VISIBLE_ITEMS;
     this.expandedGroups = new Set();
     this.expandAllSteps = false;
+
+    // Instant client-side preview from cached `all` list while background refresh runs
+    if (this.allSessionsCache.length > 0) {
+      this.sessions = next === "all"
+        ? [...this.allSessionsCache]
+        : this.allSessionsCache.filter((s) => normalizeAgentKey(s?.agent) === next);
+      const first = this.sessions[0] ?? null;
+      this.selectedKey = first ? sessionUniqueKey(first) : null;
+      this.selectedSession = first;
+      if (first) {
+        this.loadSessionTranscript(first, resolveActiveTerminalContext(), cx);
+      } else {
+        this.entries = [];
+        this.loadedSessionKey = null;
+      }
+    }
+
     this.refresh(cx, false);
     cx?.notify?.();
   }
 
-  computeContextKey(ctx, effectiveAgent) {
-    return `sessions:${ctx.supported ? 1 : 0}:${ctx.target ?? ""}:${effectiveAgent ?? ""}:${ctx.cwd ?? ""}:${ctx.activeSessionId ?? ""}:${ctx.turn ?? 0}`;
+  computeContextKey(ctx) {
+    return `sessions:${ctx.supported ? 1 : 0}:${ctx.target ?? ""}:${this.agentFilter}:${ctx.cwd ?? ""}:${ctx.activeSessionId ?? ""}:${ctx.turn ?? 0}`;
   }
 
   copyResumeCommand(session, cx) {
     const cmd = String(session?.resume_command ?? "").trim();
     if (!cmd) return;
     try { cx?.write_to_clipboard?.(cmd); } catch {}
-    this.copiedSessionId = session.session_id;
+    this.copiedKey = sessionUniqueKey(session);
     this.copiedUntil = Date.now() + 1800;
     if (typeof notify === "function") {
       notify({
@@ -732,9 +647,10 @@ export default class Sessions extends View {
   openSessionMenu(session, cx) {
     if (!session) return;
     cx?.stop_propagation?.();
-    this.hoveredRowId = null;
-    this.agentPopupOpen = false;
+    this.hoveredRowKey = null;
     this.selectSession(session, cx);
+    const catalog = this.agentCatalogFor(resolveActiveTerminalContext().machine);
+    const vis = getAgentVisual(session.agent, catalog);
     openOverlay({
       mod: "menu",
       kind: "popup",
@@ -744,8 +660,8 @@ export default class Sessions extends View {
         target: {
           sessionId: session.session_id,
           title: session.title,
-          agent: session.agent || this.agent,
-          agentName: this.agentName || session.agent || this.agent,
+          agent: session.agent,
+          agentName: vis.name,
           resumeCommand: session.resume_command,
         },
       },
@@ -754,8 +670,9 @@ export default class Sessions extends View {
 
   selectSession(session, cx) {
     if (!session || !session.session_id) return;
-    const changed = this.selectedId !== session.session_id;
-    this.selectedId = session.session_id;
+    const uKey = sessionUniqueKey(session);
+    const changed = this.selectedKey !== uKey;
+    this.selectedKey = uKey;
     this.selectedSession = session;
     if (changed) {
       this.visibleLimit = INITIAL_VISIBLE_ITEMS;
@@ -763,7 +680,7 @@ export default class Sessions extends View {
       this.expandAllSteps = false;
       this.transcriptError = null;
     }
-    const loadKey = `${session.agent || this.agent || ""}:${session.session_id}:${session.updated_ms || 0}`;
+    const loadKey = `${uKey}:${session.updated_ms || 0}`;
     if (changed || this.loadedSessionKey !== loadKey) {
       this.loadSessionTranscript(session, resolveActiveTerminalContext(), cx);
     }
@@ -795,19 +712,21 @@ export default class Sessions extends View {
     cx?.notify?.();
   }
 
-  buildListArgs(ctx, effectiveAgent) {
+  buildListArgs(ctx, filterKey) {
     const args = ["session", "ls", "--json"];
     if (ctx.target) args.push(ctx.target);
     if (ctx.cwd) args.push("--cwd", ctx.cwd);
-    if (effectiveAgent) args.push("--agent", effectiveAgent);
+    args.push("--agent", filterKey || "all");
+    if ((filterKey || "all") === "all") {
+      args.push("--limit", ALL_SESSION_LIMIT);
+    }
     if (!ctx.target && ctx.machine) args.push("--on", ctx.machine);
     return args;
   }
 
   buildReadArgs(session, ctx) {
     const args = ["session", "read", "--json", String(session.session_id)];
-    const ag = session.agent || this.agent || this.resolveEffectiveAgent(ctx);
-    if (ag) args.push("--agent", String(ag));
+    if (session.agent) args.push("--agent", String(session.agent));
     if (ctx.target) args.push("--target", ctx.target);
     const cwd = this.cwd || ctx.cwd;
     if (cwd) args.push("--cwd", cwd);
@@ -818,10 +737,11 @@ export default class Sessions extends View {
   refresh(cx, background = false) {
     const ctx = resolveActiveTerminalContext();
     this.ensureKnownAgents(ctx.machine, cx);
-    const effectiveAgent = ctx.supported ? this.resolveEffectiveAgent(ctx) : null;
-    const nextKey = this.computeContextKey(ctx, effectiveAgent);
+    const nextKey = this.computeContextKey(ctx);
     const keyChanged = nextKey !== this.context;
     if (background && !keyChanged && this.loadingList) return;
+
+    const prevCwd = this.cwd;
     this.context = nextKey;
 
     if (!ctx.supported || (!ctx.target && !ctx.cwd)) {
@@ -830,27 +750,33 @@ export default class Sessions extends View {
       this.loadingList = false;
       this.loadingTranscript = false;
       this.sessions = [];
-      this.selectedId = null;
+      this.allSessionsCache = [];
+      this.selectedKey = null;
       this.selectedSession = null;
       this.loadedSessionKey = null;
       this.entries = [];
       this.expandedGroups = new Set();
       this.expandAllSteps = false;
-      this.agent = null;
-      this.agentName = null;
       this.cwd = ctx.cwd || null;
       this.error = tr("Open a terminal or CLI agent tab to view workspace session history", "打开终端或 CLI Agent 标签页以查看当前工作区历史会话");
       cx?.notify?.();
       return;
     }
 
+    if (prevCwd && ctx.cwd && prevCwd !== ctx.cwd) {
+      this.allSessionsCache = [];
+      this.selectedKey = null;
+      this.loadedSessionKey = null;
+    }
+
     if (keyChanged && !background) {
       this.error = null;
     }
 
+    const activeFilter = this.agentFilter || "all";
     const seq = ++this.reqSeq;
     this.loadingList = true;
-    const args = this.buildListArgs(ctx, effectiveAgent);
+    const args = this.buildListArgs(ctx, activeFilter);
     cx.spawn(async (acx) => {
       try {
         const res = await h2(args);
@@ -865,24 +791,17 @@ export default class Sessions extends View {
         }
         const parsed = JSON.parse(res.stdout || "{}");
         const list = Array.isArray(parsed.sessions) ? parsed.sessions : [];
-        const prevAgent = this.agent;
-        this.agent = normalizeAgentKey(parsed.agent) || effectiveAgent || null;
-        this.agentName = parsed.agent_name || getAgentVisual(this.agent, this.agentCatalogFor(ctx.machine)).name;
         this.cwd = parsed.cwd || ctx.cwd || null;
         this.sessions = list;
+        if (activeFilter === "all") {
+          this.allSessionsCache = list;
+        }
         this.error = null;
 
-        if (prevAgent && this.agent && prevAgent !== this.agent) {
-          this.selectedId = null;
-          this.loadedSessionKey = null;
-          this.expandedGroups = new Set();
-          this.expandAllSteps = false;
-        }
-
-        let sel = this.selectedId ? list.find((s) => s?.session_id === this.selectedId) : null;
+        let sel = this.selectedKey ? list.find((s) => sessionUniqueKey(s) === this.selectedKey) : null;
         if (!sel) {
           sel = list[0] ?? null;
-          this.selectedId = sel?.session_id ?? null;
+          this.selectedKey = sel ? sessionUniqueKey(sel) : null;
           this.visibleLimit = INITIAL_VISIBLE_ITEMS;
           this.expandedGroups = new Set();
           this.expandAllSteps = false;
@@ -890,7 +809,7 @@ export default class Sessions extends View {
         this.selectedSession = sel;
 
         if (sel) {
-          const loadKey = `${sel.agent || this.agent || ""}:${sel.session_id}:${sel.updated_ms || 0}`;
+          const loadKey = `${sessionUniqueKey(sel)}:${sel.updated_ms || 0}`;
           if (this.loadedSessionKey !== loadKey) {
             await this.loadSessionTranscriptAsync(sel, ctx, acx);
           }
@@ -934,7 +853,8 @@ export default class Sessions extends View {
       }
       const parsed = JSON.parse(res.stdout || "{}");
       this.entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-      if (parsed.session_id && this.selectedId === session.session_id) {
+      const uKey = sessionUniqueKey(session);
+      if (parsed.session_id && this.selectedKey === uKey) {
         this.selectedSession = {
           ...session,
           title: parsed.title || session.title,
@@ -942,7 +862,7 @@ export default class Sessions extends View {
           resume_command: parsed.resume_command || session.resume_command,
         };
       }
-      this.loadedSessionKey = `${session.agent || this.agent || ""}:${session.session_id}:${session.updated_ms || 0}`;
+      this.loadedSessionKey = `${uKey}:${session.updated_ms || 0}`;
       this.transcriptError = null;
     } catch (e) {
       if (seq !== this.readSeq) return;
@@ -956,7 +876,7 @@ export default class Sessions extends View {
     }
   }
 
-  filteredSessions() {
+  filteredSessions(catalog) {
     const q = String(this.searchInput?.value?.() ?? "").trim().toLowerCase();
     if (!q) return this.sessions;
     return this.sessions.filter((s) => {
@@ -964,7 +884,16 @@ export default class Sessions extends View {
       const preview = String(s?.preview ?? "").toLowerCase();
       const sid = String(s?.session_id ?? "").toLowerCase();
       const branch = String(s?.git_branch ?? "").toLowerCase();
-      return title.includes(q) || preview.includes(q) || sid.includes(q) || branch.includes(q);
+      const ag = String(s?.agent ?? "").toLowerCase();
+      const agName = getAgentVisual(s?.agent, catalog).name.toLowerCase();
+      return (
+        title.includes(q)
+        || preview.includes(q)
+        || sid.includes(q)
+        || branch.includes(q)
+        || ag.includes(q)
+        || agName.includes(q)
+      );
     });
   }
 
@@ -1087,8 +1016,7 @@ export default class Sessions extends View {
     return null;
   }
 
-  renderGroupedItem(item, t, activeVisual) {
-    // Minimal, feather-light inline disclosure for thinking & tool calls (collapsed by default)
+  renderGroupedItem(item, t, sessionVisual) {
     if (item.kind === "activity_group") {
       const isOpen = this.expandAllSteps || this.expandedGroups.has(item.id);
       const summaryLabel = formatActivityGroupSummary(item);
@@ -1183,13 +1111,13 @@ export default class Sessions extends View {
             .w_full()
             .gap(6)
             .items_center()
-            .child(renderAgentIcon(activeVisual, 13, t))
+            .child(renderAgentIcon(sessionVisual, 13, t))
             .child(
               div()
                 .text_size(11.5)
                 .font_medium()
                 .text_color(t.muted)
-                .child(this.agentName || activeVisual.name),
+                .child(sessionVisual.name),
             )
             .child(div().flex_1())
             .when(Boolean(clock), (el) => el.child(div().text_size(10.5).text_color(t.dim).child(clock))),
@@ -1215,124 +1143,19 @@ export default class Sessions extends View {
     return null;
   }
 
-  renderAgentPickerPopup(liveCtx, effectiveAgent, catalog, t) {
-    const activeVisual = getAgentVisual(effectiveAgent, catalog);
-    const targetKey = liveCtx.target || `space:${liveCtx.cwd || ""}`;
-    const hasManualOverride = this.manualOverrideByTarget.has(targetKey);
+  renderAgentFilterBar(catalog, t) {
+    const countsByAgent = new Map();
+    const countSource = this.allSessionsCache.length > 0 ? this.allSessionsCache : this.sessions;
+    for (const s of countSource) {
+      const k = normalizeAgentKey(s?.agent);
+      if (k) countsByAgent.set(k, (countsByAgent.get(k) || 0) + 1);
+    }
 
-    const trigger = h_flex()
-      .id("sessions-agent-trigger")
-      .h(26)
-      .px(8)
-      .gap(6)
-      .flex_none()
-      .items_center()
-      .rounded(6)
-      .bg(this.agentPopupOpen ? (t.selected ?? t.raised) : (t.surface ?? t.background))
-      .border_1()
-      .border_color(this.agentPopupOpen ? (t.accent ?? t.border) : t.border)
-      .cursor_pointer()
-      .hover((s) => s.bg(t.hover))
-      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click((_e, cx) => {
-        cx.stop_propagation();
-        this.agentPopupOpen = !this.agentPopupOpen;
-        cx.notify();
-      })
-      .child(renderAgentIcon(activeVisual, 14, t))
-      .child(
-        div()
-          .text_size(12)
-          .font_semibold()
-          .text_color(t.foreground)
-          .child(activeVisual.name),
-      )
-      .child(div().text_size(10).text_color(t.dim).child("▾"));
-
-    return Popup.new("sessions-agent-popup", trigger)
-      .anchor("bottom_left")
-      .when(this.agentPopupOpen, (el) =>
-        el.content(
-          v_flex()
-            .id("sessions-agent-menu")
-            .w(216)
-            .max_h(280)
-            .p(4)
-            .gap(2)
-            .rounded(8)
-            .bg(t.popover ?? t.raised)
-            .border_1()
-            .border_color(t.border)
-            .overflow_y_scroll()
-            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .when(Boolean(liveCtx.detectedAgent && hasManualOverride), (menu) => {
-              const detVis = getAgentVisual(liveCtx.detectedAgent, catalog);
-              return menu
-                .child(
-                  h_flex()
-                    .id("sessions-agent-opt-auto")
-                    .h(29)
-                    .px(8)
-                    .gap(8)
-                    .items_center()
-                    .rounded(6)
-                    .cursor_pointer()
-                    .hover((s) => s.bg(t.hover))
-                    .on_click((_e, cx) => this.chooseAgent(null, liveCtx, cx))
-                    .child(renderAgentIcon(detVis, 14, t))
-                    .child(
-                      div()
-                        .flex_1()
-                        .min_w(0)
-                        .truncate()
-                        .text_size(12)
-                        .text_color(t.foreground)
-                        .child(tr(`Follow tab (${detVis.name})`, `跟随当前标签页 (${detVis.name})`)),
-                    ),
-                )
-                .child(div().h(1).mx(4).my(2).bg(t.border));
-            })
-            .children(
-              catalog.map((item) => {
-                const chosen = item.key === effectiveAgent;
-                return h_flex()
-                  .id(`sessions-agent-opt-${item.key}`)
-                  .h(29)
-                  .px(8)
-                  .gap(8)
-                  .items_center()
-                  .rounded(6)
-                  .cursor_pointer()
-                  .when(chosen, (r) => r.bg(t.selected))
-                  .hover((s) => s.bg(chosen ? t.selected : t.hover))
-                  .on_click((_e, cx) => this.chooseAgent(item.key, liveCtx, cx))
-                  .child(renderAgentIcon(item, 14, t))
-                  .child(
-                    div()
-                      .flex_1()
-                      .min_w(0)
-                      .truncate()
-                      .text_size(12)
-                      .text_color(t.foreground)
-                      .child(item.name),
-                  )
-                  .when(chosen, (r) =>
-                    r.child(div().text_size(11).text_color(t.accent ?? t.foreground).child("✓")),
-                  );
-              }),
-            ),
-        ),
-      );
-  }
-
-  renderTerminalQuickAgentBar(liveCtx, effectiveAgent, catalog, t) {
-    // Quick 1-click CLI agent switcher shown when the user is on a plain Terminal tab.
-    const quickChoices = catalog.filter((a) => a.installed);
-    const pills = (quickChoices.length > 0 ? quickChoices : catalog).slice(0, 6);
-    if (pills.length === 0) return null;
+    const isAllActive = this.agentFilter === "all";
+    const totalCount = this.allSessionsCache.length > 0 ? this.allSessionsCache.length : (isAllActive ? this.sessions.length : 0);
 
     return h_flex()
-      .id("sessions-terminal-agent-bar")
+      .id("sessions-agent-bar")
       .flex_none()
       .w_full()
       .min_w(0)
@@ -1344,17 +1167,43 @@ export default class Sessions extends View {
       .bg(t.surface ?? t.background)
       .border_b(1)
       .border_color(t.border)
+      // "All" pill (default active -> shows sessions across all CLI agents)
       .child(
-        div()
+        h_flex()
+          .id("sessions-agent-pill-all")
+          .h(24)
+          .px(9)
+          .gap(4)
           .flex_none()
-          .text_size(11)
-          .text_color(t.dim)
-          .mr(2)
-          .child(tr("Agent:", "选择 Agent：")),
+          .items_center()
+          .rounded(6)
+          .cursor_pointer()
+          .bg(isAllActive ? (t.selected ?? t.raised) : t.background)
+          .border_1()
+          .border_color(isAllActive ? (t.accent ?? t.border) : t.border)
+          .text_color(isAllActive ? t.foreground : t.muted)
+          .hover((s) => s.bg(isAllActive ? (t.selected ?? t.raised) : t.hover).text_color(t.foreground))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => this.chooseAgentFilter("all", cx))
+          .child(
+            div()
+              .text_size(11.5)
+              .when(isAllActive, (e) => e.font_medium())
+              .child(tr("All", "全部")),
+          )
+          .when(totalCount > 0, (el) =>
+            el.child(
+              div()
+                .text_size(10.5)
+                .text_color(t.dim)
+                .child(String(totalCount)),
+            ),
+          ),
       )
       .children(
-        pills.map((item) => {
-          const active = item.key === effectiveAgent;
+        catalog.map((item) => {
+          const active = this.agentFilter === item.key;
+          const cnt = countsByAgent.get(item.key) || 0;
           return h_flex()
             .id(`sessions-agent-pill-${item.key}`)
             .h(24)
@@ -1370,13 +1219,21 @@ export default class Sessions extends View {
             .text_color(active ? t.foreground : t.muted)
             .hover((s) => s.bg(active ? (t.selected ?? t.raised) : t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .on_click((_e, cx) => this.chooseAgent(item.key, liveCtx, cx))
+            .on_click((_e, cx) => this.chooseAgentFilter(item.key, cx))
             .child(renderAgentIcon(item, 12, t))
             .child(
               div()
                 .text_size(11.5)
                 .when(active, (e) => e.font_medium())
                 .child(item.name),
+            )
+            .when(cnt > 0, (el) =>
+              el.child(
+                div()
+                  .text_size(10.5)
+                  .text_color(t.dim)
+                  .child(String(cnt)),
+              ),
             );
         }),
       );
@@ -1384,19 +1241,22 @@ export default class Sessions extends View {
 
   render(cx) {
     const liveCtx = resolveActiveTerminalContext();
-    const effectiveAgent = liveCtx.supported ? this.resolveEffectiveAgent(liveCtx) : null;
-    if (this.computeContextKey(liveCtx, effectiveAgent) !== this.context && (typeof checking !== "function" || !checking())) {
+    if (this.computeContextKey(liveCtx) !== this.context && (typeof checking !== "function" || !checking())) {
       this.refresh(cx, false);
     }
 
     const t = theme();
     const accent = t.accent ?? "#3b82f6";
     const catalog = this.agentCatalogFor(liveCtx.machine);
-    const activeVisual = getAgentVisual(this.agent || effectiveAgent, catalog);
-    const filtered = this.filteredSessions();
+    const filtered = this.filteredSessions(catalog);
     const query = String(this.searchInput?.value?.() ?? "");
     const wsFolder = this.cwd || liveCtx.cwd || "";
     const wsName = folderBasename(wsFolder) || tr("Workspace", "当前目录");
+
+    const selected = this.selectedSession
+      || (this.selectedKey ? this.sessions.find((s) => sessionUniqueKey(s) === this.selectedKey) : null)
+      || null;
+    const selectedVisual = getAgentVisual(selected?.agent || (this.agentFilter !== "all" ? this.agentFilter : "claude"), catalog);
 
     const groupedItems = groupTranscriptItems(this.entries);
     const activityGroupCount = groupedItems.reduce((n, it) => n + (it.kind === "activity_group" ? 1 : 0), 0);
@@ -1407,25 +1267,18 @@ export default class Sessions extends View {
     const visibleItems = totalItems > 0 ? groupedItems.slice(hiddenCount) : [];
     const renderedEntries = [];
     for (let i = 0; i < visibleItems.length; i++) {
-      const node = this.renderGroupedItem(visibleItems[i], t, activeVisual);
+      const node = this.renderGroupedItem(visibleItems[i], t, selectedVisual);
       if (node) renderedEntries.push(node);
     }
 
-    const selected = this.selectedSession
-      || (this.selectedId ? this.sessions.find((s) => s?.session_id === this.selectedId) : null)
-      || null;
+    const justCopied = Boolean(selected && this.copiedKey === sessionUniqueKey(selected) && Date.now() < this.copiedUntil);
 
-    const justCopied = Boolean(selected && this.copiedSessionId === selected.session_id && Date.now() < this.copiedUntil);
-
-    // Upper pane: clean, breathable session list (no floating tooltips -> zero overlap with right-click menu)
+    // Upper pane: clean session list showing each session's own CLI agent icon & badge
     const sessionListPane = div()
       .id("sessions-list-pane")
       .size_full()
       .min_h(0)
       .relative()
-      .on_mouse_down("left", () => {
-        if (this.agentPopupOpen) this.agentPopupOpen = false;
-      })
       .child(
         v_flex()
           .id("sessions-list")
@@ -1437,13 +1290,15 @@ export default class Sessions extends View {
           .gap(3)
           .children(
             filtered.map((s, idx) => {
-              const isSel = selected?.session_id === s.session_id;
-              const isHovered = this.hoveredRowId === s.session_id;
+              const uKey = sessionUniqueKey(s);
+              const isSel = selected ? sessionUniqueKey(selected) === uKey : false;
+              const isHovered = this.hoveredRowKey === uKey;
+              const rowVisual = getAgentVisual(s.agent, catalog);
               const relTime = formatFriendlyTime(s.updated_ms || s.created_ms);
               const turns = Number(s.turns) || 0;
               const title = formatCleanSessionTitle(s.title || s.session_id, 110);
 
-              const subMeta = [];
+              const subMeta = [rowVisual.name];
               if (turns > 0) subMeta.push(tr(`${turns} turn${turns === 1 ? "" : "s"}`, `${turns} 轮对话`));
               if (s.git_branch) subMeta.push(s.git_branch);
 
@@ -1461,16 +1316,13 @@ export default class Sessions extends View {
                 .when(isSel, (e) => e.bg(t.selected))
                 .hover((st) => st.bg(isSel ? t.selected : t.hover))
                 .on_hover((hovered, cx) => {
-                  const next = hovered ? s.session_id : (this.hoveredRowId === s.session_id ? null : this.hoveredRowId);
-                  if (next !== this.hoveredRowId) {
-                    this.hoveredRowId = next;
+                  const next = hovered ? uKey : (this.hoveredRowKey === uKey ? null : this.hoveredRowKey);
+                  if (next !== this.hoveredRowKey) {
+                    this.hoveredRowKey = next;
                     cx.notify();
                   }
                 })
-                .on_click((_e, cx) => {
-                  this.agentPopupOpen = false;
-                  this.selectSession(s, cx);
-                })
+                .on_click((_e, cx) => this.selectSession(s, cx))
                 .on_mouse_down("right", (_e, cx) => this.openSessionMenu(s, cx))
                 .child(
                   h_flex()
@@ -1478,15 +1330,7 @@ export default class Sessions extends View {
                     .min_w(0)
                     .gap(7)
                     .items_center()
-                    .when(Boolean(s.current), (e) =>
-                      e.child(
-                        div()
-                          .size(6)
-                          .flex_none()
-                          .rounded(999)
-                          .bg(t.ansi2 ?? accent),
-                      ),
-                    )
+                    .child(renderAgentIcon(rowVisual, 14, t))
                     .child(
                       div()
                         .flex_1()
@@ -1503,12 +1347,18 @@ export default class Sessions extends View {
                     )
                     .when(Boolean(s.current), (e) =>
                       e.child(
-                        div()
+                        h_flex()
                           .flex_none()
-                          .whitespace_nowrap()
-                          .text_size(10.5)
-                          .text_color(t.ansi2 ?? accent)
-                          .child(tr("Current", "当前")),
+                          .gap(4)
+                          .items_center()
+                          .child(div().size(6).rounded(999).bg(t.ansi2 ?? accent))
+                          .child(
+                            div()
+                              .whitespace_nowrap()
+                              .text_size(10.5)
+                              .text_color(t.ansi2 ?? accent)
+                              .child(tr("Current", "当前")),
+                          ),
                       ),
                     )
                     .when(Boolean(relTime), (e) =>
@@ -1522,33 +1372,32 @@ export default class Sessions extends View {
                       ),
                     ),
                 )
-                .when(subMeta.length > 0 || isSel || isHovered, (el) =>
-                  el.child(
-                    h_flex()
-                      .w_full()
-                      .min_w(0)
-                      .gap(6)
-                      .items_center()
-                      .child(
+                .child(
+                  h_flex()
+                    .w_full()
+                    .min_w(0)
+                    .pl(21)
+                    .gap(6)
+                    .items_center()
+                    .child(
+                      div()
+                        .flex_1()
+                        .min_w(0)
+                        .truncate()
+                        .text_size(11)
+                        .text_color(t.dim)
+                        .child(subMeta.join(" · ")),
+                    )
+                    .when(isSel || isHovered, (r) =>
+                      r.child(
                         div()
-                          .flex_1()
-                          .min_w(0)
-                          .truncate()
-                          .text_size(11)
-                          .text_color(t.dim)
-                          .child(subMeta.join(" · ") || shortNameFallback(s.session_id)),
-                      )
-                      .when(isSel || isHovered, (r) =>
-                        r.child(
-                          div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_size(10.5)
-                            .text_color(t.muted)
-                            .child(tr("Right-click to copy command", "右键复制恢复命令")),
-                        ),
+                          .flex_none()
+                          .whitespace_nowrap()
+                          .text_size(10.5)
+                          .text_color(t.muted)
+                          .child(tr("Right-click to copy command", "右键复制恢复命令")),
                       ),
-                  ),
+                    ),
                 );
             }),
           )
@@ -1557,7 +1406,7 @@ export default class Sessions extends View {
               v_flex()
                 .w_full()
                 .px(12)
-                .py(20)
+                .py(22)
                 .gap(4)
                 .items_center()
                 .justify_center()
@@ -1572,19 +1421,13 @@ export default class Sessions extends View {
                           ? tr("Loading session history…", "正在读取历史会话…")
                           : query.length > 0
                             ? tr("No matching sessions", "没有匹配的历史会话")
-                            : tr(
-                                `No ${activeVisual.name} sessions in ${wsName}`,
-                                `当前目录暂无 ${activeVisual.name} 的历史会话`,
-                              )),
+                            : this.agentFilter === "all"
+                              ? tr(`No CLI agent sessions in ${wsName}`, `当前目录暂无任何 CLI Agent 的历史会话`)
+                              : tr(
+                                  `No ${getAgentVisual(this.agentFilter, catalog).name} sessions in ${wsName}`,
+                                  `当前目录暂无 ${getAgentVisual(this.agentFilter, catalog).name} 的历史会话`,
+                                )),
                     ),
-                )
-                .when(!this.loadingList && !this.error && query.length === 0 && liveCtx.isPlainTerminal, (sub) =>
-                  sub.child(
-                    div()
-                      .text_size(11)
-                      .text_color(t.dim)
-                      .child(tr("Switch agent above to inspect another CLI agent", "可在上方切换其他 CLI Agent 查看历史会话")),
-                  ),
                 ),
             ),
           ),
@@ -1597,9 +1440,6 @@ export default class Sessions extends View {
       .size_full()
       .min_w(0)
       .min_h(0)
-      .on_mouse_down("left", () => {
-        if (this.agentPopupOpen) this.agentPopupOpen = false;
-      })
       .child(
         h_flex()
           .id("sessions-detail-toolbar")
@@ -1608,13 +1448,15 @@ export default class Sessions extends View {
           .w_full()
           .min_w(0)
           .px(12)
-          .gap(8)
+          .gap(7)
           .items_center()
           .bg(t.surface ?? t.raised)
           .border_b(1)
           .border_color(t.border)
           .when(Boolean(selected), (el) =>
-            el.on_mouse_down("right", (_e, cx) => this.openSessionMenu(selected, cx)),
+            el
+              .on_mouse_down("right", (_e, cx) => this.openSessionMenu(selected, cx))
+              .child(renderAgentIcon(selectedVisual, 13, t)),
           )
           .child(
             div()
@@ -1742,10 +1584,6 @@ export default class Sessions extends View {
           .child(Scrollbar.vertical("sessions-transcript").absolute().inset_0()),
       );
 
-    const terminalAgentBar = liveCtx.supported && liveCtx.isPlainTerminal
-      ? this.renderTerminalQuickAgentBar(liveCtx, effectiveAgent, catalog, t)
-      : null;
-
     return v_flex()
       .id("sessions")
       .size_full()
@@ -1758,29 +1596,26 @@ export default class Sessions extends View {
       .text_color(t.foreground)
       .text_size(13)
       .track_focus(this.handle)
-      .on_key_down((e, cx) => {
-        if (e.key === "escape" && this.agentPopupOpen) {
-          this.agentPopupOpen = false;
-          cx.stop_propagation();
-          cx.notify();
-        }
-      })
-      // Unified single top bar: Agent selector + workspace folder + compact search + refresh
+      // Clean top bar: workspace name + count + search + refresh
       .child(
         h_flex()
           .id("sessions-header")
-          .h(42)
+          .h(40)
           .flex_none()
           .w_full()
           .min_w(0)
-          .px(10)
+          .px(12)
           .gap(8)
           .items_center()
           .bg(t.raised)
           .border_b(1)
           .border_color(t.border)
-          .when(liveCtx.supported, (el) =>
-            el.child(this.renderAgentPickerPopup(liveCtx, effectiveAgent, catalog, t)),
+          .child(
+            div()
+              .font_semibold()
+              .text_size(13)
+              .text_color(t.foreground)
+              .child(tr("Sessions", "会话")),
           )
           .child(
             div()
@@ -1795,7 +1630,7 @@ export default class Sessions extends View {
           .child(
             h_flex()
               .id("sessions-search-wrap")
-              .w(156)
+              .w(168)
               .flex_none()
               .h(26)
               .px(8)
@@ -1806,10 +1641,7 @@ export default class Sessions extends View {
               .border_1()
               .border_color(this.searchFocused ? accent : t.border)
               .cursor_text()
-              .on_mouse_down("left", (_e, cx) => {
-                cx.stop_propagation();
-                if (this.agentPopupOpen) this.agentPopupOpen = false;
-              })
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .child(Input.new(this.searchInput).flex_1().min_w(0).h_full().text_size(11.5).text_color(t.foreground))
               .when(query.length > 0, (el) =>
                 el.child(
@@ -1844,10 +1676,7 @@ export default class Sessions extends View {
               .hover((s) => s.bg(t.hover).text_color(t.foreground))
               .tooltip(tr("Refresh", "刷新"))
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => {
-                this.agentPopupOpen = false;
-                this.refresh(cx, false);
-              })
+              .on_click((_e, cx) => this.refresh(cx, false))
               .child(
                 svg(this.loadingList ? "mods/workspace-chrome/spinner.svg" : "frame/settings/refresh.svg")
                   .size(13)
@@ -1855,8 +1684,8 @@ export default class Sessions extends View {
               ),
           ),
       )
-      // When in a plain Terminal tab, show prominent 1-click CLI Agent pills
-      .when(Boolean(terminalAgentBar), (el) => el.child(terminalAgentBar))
+      // Unified Agent filter bar (identical on both CLI Agent tabs and plain Terminal tabs!)
+      .when(liveCtx.supported, (el) => el.child(this.renderAgentFilterBar(catalog, t)))
       // Vertically resizable split between session list (top) and conversation detail (bottom)
       .child(
         v_resizable("sessions-split")
@@ -1887,10 +1716,4 @@ export default class Sessions extends View {
           ),
       );
   }
-}
-
-function shortNameFallback(sid) {
-  const s = String(sid ?? "").trim();
-  if (s.length <= 12) return s;
-  return `${s.slice(0, 8)}…`;
 }

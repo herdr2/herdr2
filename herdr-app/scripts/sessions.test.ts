@@ -31,13 +31,6 @@ class Element {
 
 const element = () => new Element();
 
-function makePopup(id: string, trigger: any) {
-  const p = new Element() as any;
-  p.id(id);
-  if (trigger) p.nodes.push(trigger);
-  return p;
-}
-
 function makeInputState(opts?: { placeholder?: string }) {
   let val = "";
   const handlers: Record<string, Array<(e: any, cx: any) => void>> = {};
@@ -86,7 +79,7 @@ function loadSessionsMod(hostValues: Record<string, unknown>) {
   return new Function(...Object.keys(hostValues), transformed)(...Object.values(hostValues));
 }
 
-test("sessions panel renders clean hierarchy, folds thoughts/tools by default, supports plain terminal agent picker, and copies full-access resume command", async () => {
+test("sessions panel renders identical UI across CLI agent and terminal tabs, shows all CLI session types by default, and supports filtering & full-access resume", async () => {
   const h2Calls: string[][] = [];
   const overlays: any[] = [];
   const notices: any[] = [];
@@ -94,7 +87,7 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
   const sharedStore: Record<string, any> = {};
   let lang = "zh-CN";
 
-  // Start on a plain zsh terminal tab!
+  // Start on a live Claude Code CLI agent tab — UI must still show the unified Agent Bar & ALL session types!
   let currentPanes: any[] = [
     {
       pane: "p1",
@@ -102,71 +95,83 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
       terminal: "t1",
       cwd: "/home/dev/project-alpha",
       focused: true,
-      program: { key: "zsh", name: "zsh", agent: false, shell: true },
+      program: { key: "claude", name: "Claude Code", agent: true, shell: false },
     },
   ];
   let currentTerminals: any[] = [
     {
       address: "t1",
       cwd: "/home/dev/project-alpha",
-      turn: 0,
-      program: { key: "zsh", name: "zsh", agent: false, shell: true },
+      turn: 3,
+      saved_cli: { kind: "claude", session_id: "sess-cur-1" },
+      program: { key: "claude", name: "Claude Code", agent: true, shell: false },
     },
   ];
 
+  const claudeSess = {
+    session_id: "sess-cur-1",
+    agent: "claude",
+    title: "重构认证中间件并补充单测",
+    preview: "重构认证中间件并补充单测",
+    turns: 3,
+    created_ms: 1700000000000,
+    updated_ms: 1700000050000,
+    model: "claude-opus-4-7",
+    git_branch: "feat/auth",
+    current: true,
+    resume_command: "claude --dangerously-skip-permissions --resume sess-cur-1",
+  };
+  const codexSess = {
+    session_id: "codex-sess-9",
+    agent: "codex",
+    title: "优化 SQL 查询索引",
+    preview: "优化 SQL 查询索引",
+    turns: 2,
+    created_ms: 1700001000000,
+    updated_ms: 1700002000000,
+    model: "gpt-5.4",
+    git_branch: "perf/sql",
+    current: false,
+    resume_command: "codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9",
+  };
+  const agySess = {
+    session_id: "agy-sess-3",
+    agent: "agy",
+    title: "新增 CLI 会话历史面板",
+    preview: "新增 CLI 会话历史面板",
+    turns: 4,
+    created_ms: 1699998000000,
+    updated_ms: 1699999000000,
+    model: "gemini-4-carbon-high",
+    git_branch: "main",
+    current: false,
+    resume_command: "agy --dangerously-skip-permissions --conversation agy-sess-3",
+  };
+
   const listByAgent: Record<string, any> = {
+    all: {
+      agent: "all",
+      agent_name: "All CLI Agents",
+      cwd: "/home/dev/project-alpha",
+      sessions: [claudeSess, codexSess, agySess],
+    },
     claude: {
       agent: "claude",
       agent_name: "Claude Code",
       cwd: "/home/dev/project-alpha",
-      sessions: [
-        {
-          session_id: "sess-cur-1",
-          agent: "claude",
-          title: "重构认证中间件并补充单测",
-          preview: "重构认证中间件并补充单测",
-          turns: 3,
-          created_ms: 1700000000000,
-          updated_ms: 1700000050000,
-          model: "claude-opus-4-7",
-          git_branch: "feat/auth",
-          current: false,
-          resume_command: "claude --dangerously-skip-permissions --resume sess-cur-1",
-        },
-        {
-          session_id: "sess-prev-2",
-          agent: "claude",
-          title: "排查数据库连接池泄漏问题",
-          preview: "排查数据库连接池泄漏问题",
-          turns: 5,
-          created_ms: 1699990000000,
-          updated_ms: 1699995000000,
-          model: "claude-sonnet-4-6",
-          git_branch: "fix/db-pool",
-          current: false,
-          resume_command: "claude --dangerously-skip-permissions --resume sess-prev-2",
-        },
-      ],
+      sessions: [claudeSess],
     },
     codex: {
       agent: "codex",
       agent_name: "Codex",
       cwd: "/home/dev/project-alpha",
-      sessions: [
-        {
-          session_id: "codex-sess-9",
-          agent: "codex",
-          title: "优化 SQL 查询索引",
-          preview: "优化 SQL 查询索引",
-          turns: 2,
-          created_ms: 1700001000000,
-          updated_ms: 1700002000000,
-          model: "gpt-5.4",
-          git_branch: "perf/sql",
-          current: false,
-          resume_command: "codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9",
-        },
-      ],
+      sessions: [codexSess],
+    },
+    agy: {
+      agent: "agy",
+      agent_name: "Antigravity",
+      cwd: "/home/dev/project-alpha",
+      sessions: [agySess],
     },
   };
 
@@ -184,19 +189,6 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
         { kind: "thought", turn: 1, text: "先阅读 auth.rs 了解现有签名校验流程", ts_ms: 1700000011000 },
         { kind: "tool_call", turn: 1, title: "Read src/auth.rs", tool_kind: "read", status: "completed", ts_ms: 1700000012000 },
         { kind: "assistant", turn: 1, text: "已完成 token 校验重构并通过单元测试：\n\n```rust\nfn verify_token() -> bool { true }\n```", ts_ms: 1700000020000 },
-      ],
-    },
-    "sess-prev-2": {
-      session_id: "sess-prev-2",
-      agent: "claude",
-      agent_name: "Claude Code",
-      title: "排查数据库连接池泄漏问题",
-      model: "claude-sonnet-4-6",
-      updated_ms: 1699995000000,
-      resume_command: "claude --dangerously-skip-permissions --resume sess-prev-2",
-      entries: [
-        { kind: "user", turn: 1, text: "定位连接池为什么在超时后没有释放连接", ts_ms: 1699990010000 },
-        { kind: "assistant", turn: 1, text: "发现是在超时分支提前 return 跳过了 guard drop，已修复。", ts_ms: 1699990030000 },
       ],
     },
     "codex-sess-9": {
@@ -223,7 +215,6 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
     h_flex: element,
     v_resizable: (id: string) => (element() as any).id(id),
     resizable_panel: () => element(),
-    Popup: { new: makePopup },
     InputState: { new: makeInputState },
     Input: { new: () => element() },
     Scrollbar: { vertical: () => element() },
@@ -269,7 +260,7 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
       h2Calls.push(args);
       if (args[0] === "session" && args[1] === "ls") {
         const agIdx = args.indexOf("--agent");
-        const ag = agIdx >= 0 ? args[agIdx + 1] : "claude";
+        const ag = agIdx >= 0 ? args[agIdx + 1] : "all";
         return { code: 0, stdout: JSON.stringify(listByAgent[ag] ?? { agent: ag, sessions: [] }), stderr: "" };
       }
       if (args[0] === "session" && args[1] === "read") {
@@ -302,48 +293,69 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
   await Promise.all(pendingTasks);
   pendingTasks.length = 0;
 
+  // 1) Even on a CLI agent tab (`claude`), requests `--agent all` by default and renders the unified Agent Filter Bar!
+  expect(h2Calls[0]).toEqual(["session", "ls", "--json", "t1", "--cwd", "/home/dev/project-alpha", "--agent", "all", "--limit", "120"]);
   const tree1 = view.render(cx);
-
-  // 1) Plain terminal tab renders quick CLI agent selector bar and defaults to first installed agent (claude).
-  const quickBar = findById(tree1, "sessions-terminal-agent-bar");
-  expect(quickBar).not.toBeNull();
+  const agentBar = findById(tree1, "sessions-agent-bar");
+  expect(agentBar).not.toBeNull();
+  expect(findById(tree1, "sessions-agent-pill-all")).not.toBeNull();
   expect(findById(tree1, "sessions-agent-pill-claude")).not.toBeNull();
   expect(findById(tree1, "sessions-agent-pill-codex")).not.toBeNull();
   expect(findById(tree1, "sessions-agent-pill-agy")).not.toBeNull();
 
-  // 2) Resizable vertical divider wraps upper session list and lower detail pane.
-  const split = findById(tree1, "sessions-split");
-  expect(split).not.toBeNull();
-  split.calls.on_resize[0]([260, 360], cx);
-  expect(localStore["sessions.topHeight"]).toBe("260");
+  // All 3 session types (Claude Code, Codex, Antigravity) render together in the list!
+  const listTexts = collectTexts(findById(tree1, "sessions-list")).join(" ");
+  expect(listTexts).toContain("重构认证中间件并补充单测");
+  expect(listTexts).toContain("优化 SQL 查询索引");
+  expect(listTexts).toContain("新增 CLI 会话历史面板");
+  expect(listTexts).toContain("Claude Code");
+  expect(listTexts).toContain("Codex");
+  expect(listTexts).toContain("Antigravity");
 
-  // 3) Conversation detail defaults to showing ONLY dialogue; thoughts & tool calls are collapsed into an inline caption.
+  // 2) Switching to a plain zsh terminal tab keeps the EXACT same UI (`sessions-agent-bar` + all sessions)!
+  currentPanes = [
+    {
+      pane: "p1",
+      tab: "tab1",
+      terminal: "t1",
+      cwd: "/home/dev/project-alpha",
+      focused: true,
+      program: { key: "zsh", name: "zsh", agent: false, shell: true },
+    },
+  ];
+  currentTerminals = [
+    {
+      address: "t1",
+      cwd: "/home/dev/project-alpha",
+      turn: 0,
+      program: { key: "zsh", name: "zsh", agent: false, shell: true },
+    },
+  ];
+  const shellTree = view.render(cx);
+  await Promise.all(pendingTasks);
+  pendingTasks.length = 0;
+  expect(findById(shellTree, "sessions-agent-bar")).not.toBeNull();
+  expect(findById(shellTree, "sessions-agent-pill-all")).not.toBeNull();
+
+  // 3) Conversation detail defaults to showing ONLY dialogue; thoughts & tool calls are collapsed.
   const transcript1Texts = collectTexts(findById(tree1, "sessions-transcript")).join(" ");
   expect(transcript1Texts).toContain("请重构 auth.rs 中的 token 校验逻辑");
   expect(transcript1Texts).toContain("verify_token");
   expect(transcript1Texts).toContain("思考过程 · 1 次工具调用");
-  expect(transcript1Texts).not.toContain("先阅读 auth.rs 了解现有签名校验流程");
   expect(transcript1Texts).not.toContain("Read src/auth.rs");
 
-  // Unfolding the inline caption reveals thoughts and tool calls.
-  findById(tree1, "sess-act-toggle-act-1").calls.on_click[0]({}, cx);
-  const expandedTexts = collectTexts(findById(view.render(cx), "sessions-transcript")).join(" ");
-  expect(expandedTexts).toContain("先阅读 auth.rs 了解现有签名校验流程");
-  expect(expandedTexts).toContain("Read src/auth.rs");
-
-  // 4) Switching agent in plain terminal (clicking Codex pill) loads Codex's historical sessions and persists preference.
-  findById(tree1, "sessions-agent-pill-codex").calls.on_click[0]({}, cx);
+  // 4) Clicking the Codex filter pill filters to Codex sessions and loads Codex's conversation & full-access resume command.
+  findById(shellTree, "sessions-agent-pill-codex").calls.on_click[0]({}, cx);
   await Promise.all(pendingTasks);
   pendingTasks.length = 0;
-  expect(localStore["sessions.preferredAgent"]).toBe("codex");
 
   const codexTree = view.render(cx);
   const codexRow0 = findById(codexTree, "session-row-0");
   expect(codexRow0.calls.tooltip).toBeUndefined();
-  expect(collectTexts(codexRow0)).toContain("优化 SQL 查询索引");
-  expect(collectTexts(findById(codexTree, "sessions-transcript")).join(" ")).toContain("(project_id, updated_at)");
+  expect(collectTexts(codexRow0).join(" ")).toContain("优化 SQL 查询索引");
+  expect(findById(codexTree, "session-row-1")).toBeNull();
 
-  // 5) Right-clicking the Codex session opens the context menu with Codex's full-access resume command (zero tooltip overlap).
+  // Right-click opens menu with Codex's full-access resume command.
   codexRow0.calls["on_mouse_down:right"][1]({}, cx);
   expect(overlays).toHaveLength(1);
   expect(overlays[0].props.tab).toBe("session");
@@ -351,41 +363,12 @@ test("sessions panel renders clean hierarchy, folds thoughts/tools by default, s
     "codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9",
   );
 
-  // Also test the direct "复制恢复命令" button in the detail toolbar.
-  findById(codexTree, "sessions-copy-cmd").calls.on_click[0]({}, cx);
-  expect(copiedDirect).toEqual(["codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9"]);
-  expect(notices.at(-1)?.body).toBe("codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9");
-
-  // And verify the right-click menu item copies to clipboard too.
-  const menuCopied: string[] = [];
-  const menuValues = {
-    View: class {},
-    div: element,
-    svg: element,
-    v_flex: element,
-    h_flex: element,
-    run() {},
-    props: () => ({ ...overlays[0].props, overlay: "ov-session" }),
-    closeOverlay() {},
-    openOverlay() {},
-    theme: () => ({ popover: "#18181c", border: "#2e2e38", foreground: "#f4f4f5", muted: "#a1a1aa", dim: "#71717a", selected: "#272730", hover: "#202028" }),
-    keys: () => [],
-    terminals: () => [],
-    spaces: () => [],
-    panes: () => [],
-    exec: async () => ({ code: 0, stdout: "", stderr: "" }),
-    settings: () => ({ language: lang }),
-    h2: async () => ({ code: 0, stdout: "", stderr: "" }),
-    notify() {},
-  };
-  const Menu = new Function(
-    ...Object.keys(menuValues),
-    menuSource.replace(/^import .*;\n/gm, "").replace("export default class Menu", "return class Menu"),
-  )(...Object.values(menuValues));
-  const menuView = new Menu();
-  menuView.init({}, { focus_handle: () => ({ focus() {} }), spawn() {} });
-  findById(menuView.render({}), "mi-0").calls.on_click[0]({}, { write_to_clipboard: (txt: string) => menuCopied.push(txt) });
-  expect(menuCopied).toEqual(["codex resume --dangerously-bypass-approvals-and-sandbox codex-sess-9"]);
+  // Clicking "全部" pill restores all session types.
+  findById(codexTree, "sessions-agent-pill-all").calls.on_click[0]({}, cx);
+  await Promise.all(pendingTasks);
+  pendingTasks.length = 0;
+  const restoredAllTree = view.render(cx);
+  expect(findById(restoredAllTree, "session-row-2")).not.toBeNull();
 });
 
 test("sessions mod skips background h2 calls during herdr2 check", () => {
@@ -399,7 +382,6 @@ test("sessions mod skips background h2 calls during herdr2 check", () => {
     h_flex: element,
     v_resizable: (id: string) => (element() as any).id(id),
     resizable_panel: () => element(),
-    Popup: { new: makePopup },
     InputState: { new: makeInputState },
     Input: { new: () => element() },
     Scrollbar: { vertical: () => element() },

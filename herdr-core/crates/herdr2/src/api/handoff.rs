@@ -38,7 +38,8 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     if let Some(inline_md) = p.inline_markdown.as_deref().map(str::trim).filter(|s| !s.is_empty())
         && let Some(into_raw) = p.into.as_deref().map(str::trim).filter(|s| !s.is_empty())
     {
-        let src_addr = p.inline_source.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&p.source).to_string();
+        let src_addr =
+            p.inline_source.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&p.source).to_string();
         let src = SourceSnapshot {
             address: src_addr.clone(),
             cwd: String::new(),
@@ -483,11 +484,8 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
             if entries.is_empty()
                 && let Some(screen_text) = screen_fallback.as_deref()
             {
-                let screen_lines: Vec<&str> = screen_text
-                    .lines()
-                    .map(str::trim_end)
-                    .skip_while(|l| l.is_empty())
-                    .collect();
+                let screen_lines: Vec<&str> =
+                    screen_text.lines().map(str::trim_end).skip_while(|l| l.is_empty()).collect();
                 let end = screen_lines.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1);
                 if end > 0 {
                     let mut tail = Vec::new();
@@ -785,7 +783,9 @@ async fn handoff_into_existing(
             } else if let Some(prompt_text) = clean_prompt {
                 if p.kind == LineageKind::SendContext {
                     if is_zh {
-                        pointer.push_str(&format!("\n备注：{prompt_text}\n请先读取上述上下文文件，再结合备注直接回复或处理。"));
+                        pointer.push_str(&format!(
+                            "\n备注：{prompt_text}\n请先读取上述上下文文件，再结合备注直接回复或处理。"
+                        ));
                     } else {
                         pointer.push_str(&format!("\nNote: {prompt_text}\nPlease read the context file above and respond or act according to this note."));
                     }

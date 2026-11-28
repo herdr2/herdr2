@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.0.29
+
+#### 中文
+
+**行为优化**
+- **统一 CLI Agent 与普通终端下的「会话（`Sessions`）」面板体验，支持全类型会话聚合**：
+  - Core 侧 `session.list` / `h2 session ls` 新增 `--agent all` 及缺省全类型会话聚合能力，单次请求即可汇总当前工作区下各 CLI Agent（Claude Code、Codex、Antigravity、Cursor、ZCode 等）的历史会话，并按 `(agent, session_id)` 去重与时间排序。
+  - 桌面端「会话」面板在 CLI Agent 标签页与普通终端标签页保持完全一致的筛选胶囊栏（默认选中「全部」+ 各 Agent 图标及计数胶囊），混合展示所有类型历史会话并在每张卡片标注所属 Agent 图标、名称与对应的恢复命令。
+
+---
+
+#### English
+
+**Improvements**
+- **Unified `Sessions` Panel Across CLI Agent & Terminal Tabs with All-Agent Aggregation**:
+  - Added `--agent all` and default all-agent aggregation to Core `session.list` / `h2 session ls`, merging historical workspace sessions across installed CLI agents (Claude Code, Codex, Antigravity, Cursor, ZCode, etc.) with `(agent, session_id)` deduplication and recency sorting.
+  - Unified the desktop `Sessions` panel UI across CLI Agent and regular terminal tabs with the shared filter bar (`All` selected by default alongside per-agent icon & count pills), displaying mixed-agent history cards with per-session agent badges and agent-specific full-access resume commands.
+
 ## v2.0.28
 
 #### 中文
