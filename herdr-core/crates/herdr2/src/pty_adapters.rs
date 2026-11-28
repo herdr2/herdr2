@@ -1268,7 +1268,10 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         let Some(ref saved) = t.saved_cli else {
             return;
         };
-        if saved.session_id.as_deref().is_some_and(|s| saved.kind != "agy" || crate::pty_transcript::is_valid_agy_cid(s))
+        if saved
+            .session_id
+            .as_deref()
+            .is_some_and(|s| saved.kind != "agy" || crate::pty_transcript::is_valid_agy_cid(s))
             && saved.transcript_path.is_some()
         {
             return;
@@ -1298,7 +1301,8 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
                 }
                 if saved.kind == "agy"
                     && let Some(opid) = other.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok())
-                    && let crate::pty_transcript::ProcAgyProbe::Locked(cid) = crate::pty_transcript::probe_agy_proc(opid)
+                    && let crate::pty_transcript::ProcAgyProbe::Locked(cid) =
+                        crate::pty_transcript::probe_agy_proc(opid)
                 {
                     excluded.insert(cid);
                 }
@@ -1350,7 +1354,8 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         return;
     }
     let mut changed = false;
-    let needs_sid_update = saved.session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s));
+    let needs_sid_update =
+        saved.session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s));
     if needs_sid_update {
         saved.session_id = Some(sid.clone());
         changed = true;
@@ -1364,7 +1369,8 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         if tc.cli_kind.is_none() || tc.cli_kind.as_deref() == Some("generic") {
             tc.cli_kind = Some(kind_str.clone());
         }
-        if tc.cli_session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s)) {
+        if tc.cli_session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s))
+        {
             tc.cli_session_id = Some(sid);
         }
         if tc.cli_transcript_path.is_none() {
@@ -2843,6 +2849,7 @@ pub async fn rollback_pty_terminal(
             t.records.clear();
             t.reason = Some("rollback".into());
         }
+        core.clear_manual_status_pty(&mut st, id);
         let (tx, rx) = tokio::sync::oneshot::channel();
         st.pending.insert(id, tx);
         core.save_pty(&st);
@@ -3641,10 +3648,7 @@ mod tests {
         );
         // Paths containing single quotes fall back to JSON double-quoted strings with forward slashes (no `\\`).
         let apos = codex_notify_override(r"C:\Users\O'Brien\h2.exe");
-        assert_eq!(
-            apos,
-            "notify=[\"C:/Users/O'Brien/h2.exe\",\"checkpoint\",\"hook\",\"--source\",\"codex-notify\"]"
-        );
+        assert_eq!(apos, "notify=[\"C:/Users/O'Brien/h2.exe\",\"checkpoint\",\"hook\",\"--source\",\"codex-notify\"]");
         assert!(!apos.contains('\\'), "Windows codex notify must not emit backslashes: {apos}");
 
         let dir = crate::test_tmp().join(format!("h2-codex-win-notify-{}", crate::platform::random_hex()));

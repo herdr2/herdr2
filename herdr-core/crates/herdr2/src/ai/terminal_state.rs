@@ -32,6 +32,9 @@ pub struct ClassifyTerminalStateParams {
     /// Bottom lines of the live terminal viewport (at most 15 lines kept).
     #[serde(default)]
     pub tail_lines: Vec<String>,
+    /// Optional latest user prompt submitted to this session for task-completion context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
     /// Preferred UI language (`zh-CN` / `en`) for concise `summary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
@@ -116,15 +119,24 @@ pub async fn classify_terminal_state(
     let lang =
         if params.language.as_deref().is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) { "zh" } else { "en" };
     let prog = params.program.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    let compact_prompt = params
+        .last_user_prompt
+        .as_deref()
+        .map(|s| strip_and_dedup_lines(s, 4, 160, 280))
+        .filter(|s| !s.trim().is_empty());
     let norm_title = normalize_for_fingerprint(&params.raw_title);
     let norm_tail = normalize_for_fingerprint(&compact_tail);
-    let cache_key = format!("pty_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_title, &norm_tail]));
+    let norm_prompt = compact_prompt.as_deref().map(normalize_for_fingerprint).unwrap_or_default();
+    let cache_key = format!("pty_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_title, &norm_prompt, &norm_tail]));
 
-    let payload = json!({
+    let mut payload = json!({
         "program": prog,
         "raw_title": strip_and_dedup_lines(&params.raw_title, 1, 120, 120),
         "tail": compact_tail,
     });
+    if let Some(ref p) = compact_prompt {
+        payload["last_user_prompt"] = json!(p);
+    }
     let user_prompt = format_op_user_message("pty_status", lang, &payload);
 
     let Some(resp) = ai
@@ -162,6 +174,7 @@ pub async fn classify_terminal_state(
 pub async fn classify_acp_turn_state(
     ai: &AiRuntime,
     program: &str,
+    last_user_prompt: Option<&str>,
     assistant_text: &str,
     language: Option<&str>,
 ) -> ClassifyTerminalStateResult {
@@ -178,14 +191,20 @@ pub async fn classify_acp_turn_state(
 
     let lang = if language.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) { "zh" } else { "en" };
     let prog = program.trim().to_ascii_lowercase();
+    let compact_prompt =
+        last_user_prompt.map(|s| strip_and_dedup_lines(s, 4, 160, 280)).filter(|s| !s.trim().is_empty());
     let norm_tail = normalize_for_fingerprint(&compact_tail);
-    let cache_key = format!("acp_turn_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_tail]));
+    let norm_prompt = compact_prompt.as_deref().map(normalize_for_fingerprint).unwrap_or_default();
+    let cache_key = format!("acp_turn_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_prompt, &norm_tail]));
 
-    let payload = json!({
+    let mut payload = json!({
         "program": prog,
         "raw_title": "ACP turn finished: return blocked (kind=question) ONLY if the agent paused asking the user a question/choice to proceed; return done if the agent completed the task without asking a blocking question",
         "tail": compact_tail,
     });
+    if let Some(ref p) = compact_prompt {
+        payload["last_user_prompt"] = json!(p);
+    }
     let user_prompt = format_op_user_message("pty_status", lang, &payload);
 
     let Some(resp) = ai

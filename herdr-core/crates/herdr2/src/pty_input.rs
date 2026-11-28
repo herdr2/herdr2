@@ -78,6 +78,14 @@ impl Gate {
         }
     }
 
+    pub fn has_draft(&self) -> bool {
+        self.draft > 0
+    }
+
+    pub fn draft_just_ended(&self) -> bool {
+        self.draft_ended
+    }
+
     /// Submitting input also waits for the draft, bounded since the last human key.
     fn wait(&self, quiet: Duration, submits: bool, draft: Duration) -> Duration {
         let Some(at) = self.last_human else { return Duration::ZERO };
@@ -432,11 +440,7 @@ impl Core {
                 if word.as_deref() == Some("blocked") && blocked_kind != Some("question") && !force {
                     return Err(RpcError::new(
                         "blocked",
-                        format!(
-                            "{} is blocked ({})",
-                            crate::terminals::address(id),
-                            blocked_kind.unwrap_or("waiting")
-                        ),
+                        format!("{} is blocked ({})", crate::terminals::address(id), blocked_kind.unwrap_or("waiting")),
                         format!(
                             "typing would answer its dialog; read its screen first (h2 read {}), or --force",
                             crate::terminals::address(id)
@@ -481,6 +485,10 @@ impl Core {
                 Ok(((word, t.turn, t.reported), steps))
             })
             .await?;
+        if !first_task {
+            let mut st = self.lock();
+            self.clear_manual_status_pty(&mut st, id);
+        }
         if !text.trim().is_empty() {
             let mut st = self.lock();
             let list = st.pty_prompts.entry(id).or_default();
@@ -536,28 +544,41 @@ impl Core {
 
     /// Named keys, after a person has paused typing.
     pub async fn keys(&self, id: u32, names: &[String]) -> Result<(Option<String>, u64), RpcError> {
-        self.type_in(id, quiet(), false, |st, t| {
-            let screen = st.screens.get(&id).expect("live terminal has a screen");
-            let mut steps = Vec::new();
-            for name in names {
-                let bytes = crate::keys::encode(screen, name)?;
-                let mut key = Gate::default();
-                key.track(&bytes);
-                steps.push(if key.draft_ended { Step::EndDraft(bytes) } else { Step::Write(bytes) });
-                steps.push(Step::Pause(KEY_GAP));
-            }
-            Ok(((state_word(t), t.turn), steps))
-        })
-        .await
+        let mut ended_draft = false;
+        let out = self
+            .type_in(id, quiet(), false, |st, t| {
+                let screen = st.screens.get(&id).expect("live terminal has a screen");
+                let mut steps = Vec::new();
+                for name in names {
+                    let bytes = crate::keys::encode(screen, name)?;
+                    let mut key = Gate::default();
+                    key.track(&bytes);
+                    ended_draft |= key.draft_ended;
+                    steps.push(if key.draft_ended { Step::EndDraft(bytes) } else { Step::Write(bytes) });
+                    steps.push(Step::Pause(KEY_GAP));
+                }
+                Ok(((state_word(t), t.turn), steps))
+            })
+            .await?;
+        if ended_draft {
+            let mut st = self.lock();
+            self.clear_manual_status_pty(&mut st, id);
+        }
+        Ok(out)
     }
 
     /// Esc for programs that report status, else ctrl+c; then watch what happens.
     pub async fn pty_interrupt(&self, id: u32, timeout: Duration) -> Result<(Interrupted, String), RpcError> {
         let (reported, pid) = {
-            let st = self.lock();
-            let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal removed", ""))?;
-            t.check_program()?;
-            (t.reported, t.pid.unwrap_or(0) as i32)
+            let mut st = self.lock();
+            let (reported, pid) = {
+                let t =
+                    st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal removed", ""))?;
+                t.check_program()?;
+                (t.reported, t.pid.unwrap_or(0) as i32)
+            };
+            self.clear_manual_status_pty(&mut st, id);
+            (reported, pid)
         };
         let before = if reported { -1 } else { self.foreground(id).await };
         let key = self

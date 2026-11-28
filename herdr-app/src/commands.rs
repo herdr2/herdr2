@@ -111,6 +111,21 @@ pub const COMMANDS: &[Command] = &[
         "Send a message to a live ACP agent or CLI terminal (default target: focused or active session).",
     ),
     cmd(
+        "agent.approve",
+        &[opt("agent"), opt("terminal"), opt("option")],
+        "Approve a pending permission request on an ACP agent (default target: focused or active session).",
+    ),
+    cmd(
+        "agent.deny",
+        &[opt("agent"), opt("terminal"), opt("option")],
+        "Deny a pending permission request on an ACP agent (default target: focused or active session).",
+    ),
+    cmd(
+        "agent.interrupt",
+        &[opt("agent"), opt("terminal")],
+        "Interrupt the active turn or waiting prompt on an ACP agent or CLI terminal.",
+    ),
+    cmd(
         "agent.send_review",
         &[
             opt("target"),

@@ -1486,17 +1486,55 @@ struct ManualStatus {
     set_at: Instant,
     /// True once `herdr.status` has been observed back from core (or originally hydrated from core).
     label_synced: bool,
+    /// User concrete action watermark captured when the manual status was set.
+    latched_action_at: Option<Instant>,
+    /// Core turn watermark captured when the manual status was set.
+    latched_turn: u64,
+    /// Raw execution state (`working` / `blocked` / `idle` / `done`) captured when set.
+    latched_raw_state: Option<String>,
+}
+
+fn should_release_manual_status(
+    entry: &ManualStatus,
+    now: Instant,
+    cur_action_at: Option<Instant>,
+    cur_turn: u64,
+    cur_raw_state: Option<&str>,
+    is_reported: bool,
+) -> bool {
+    if entry.status.is_none() {
+        return false;
+    }
+    if cur_action_at > entry.latched_action_at && cur_action_at.is_some_and(|t| t > entry.set_at) {
+        return true;
+    }
+    // If an external agent/CLI triggered a brand-new turn or working run after the override settled,
+    // resume live tracking automatically while ignoring passive polls on the existing turn.
+    if is_reported && entry.label_synced && now.saturating_duration_since(entry.set_at) > Duration::from_millis(800) {
+        if cur_turn > entry.latched_turn {
+            return true;
+        }
+        if entry.latched_raw_state.as_deref() != Some("working") && cur_raw_state == Some("working") {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug)]
 struct BlockedHold {
-    /// Preserved AI verdict metadata when `"blocked"` came from AI arbitration.
+    /// Preserved blocker kind (`permission`, `question`, `auth`, `error`) while held.
     ai_kind: Option<String>,
+    /// Preserved human-readable blocker summary while held.
     ai_summary: Option<String>,
-    /// Terminal non-empty prompt-submission watermark captured when entering `"blocked"`.
-    latched_submit_at: Option<Instant>,
-    /// Core turn watermark captured when entering `"blocked"` (used for headless ACP prompt turns).
+    /// Source of the blocked judgment (`permission`, `ai`, `protocol`, `inferred`).
+    source: &'static str,
+    /// Concrete user action watermark captured when entering `"blocked"`.
+    latched_action_at: Option<Instant>,
+    /// Core turn watermark captured when entering `"blocked"`.
     latched_turn: u64,
+    /// Whether `pending_permission` was present when entering `"blocked"`.
+    had_pending_permission: bool,
     /// Whether this address is a headless ACP agent.
     is_acp: bool,
 }
@@ -1504,17 +1542,28 @@ struct BlockedHold {
 fn should_release_blocked_hold(
     hold: &BlockedHold,
     has_manual_status: bool,
-    cur_submit_at: Option<Instant>,
+    cur_action_at: Option<Instant>,
     cur_turn: u64,
+    cur_has_pending_permission: bool,
+    cur_raw_state: Option<&str>,
+    cur_inbox_len: u64,
 ) -> bool {
     if has_manual_status {
         return true;
     }
-    if cur_submit_at > hold.latched_submit_at {
+    if cur_action_at > hold.latched_action_at {
         return true;
     }
-    if hold.is_acp && cur_turn > hold.latched_turn {
+    if hold.had_pending_permission && !cur_has_pending_permission {
         return true;
+    }
+    if hold.is_acp {
+        if cur_turn > hold.latched_turn || cur_inbox_len > 0 {
+            return true;
+        }
+        if cur_raw_state == Some("working") && !cur_has_pending_permission {
+            return true;
+        }
     }
     false
 }
@@ -1659,8 +1708,10 @@ pub struct AppWindow {
     /// Manual status overrides (`herdr.status`), keyed by terminal/agent address.
     manual_statuses: HashMap<String, ManualStatus>,
     /// Latched `"blocked"` ("Needs you") holds: once an agent is judged `"blocked"`, its internal
-    /// and sidebar status stays locked until the user converses with it or manually changes status.
+    /// and sidebar status stays locked until the user performs a concrete operation or manually changes status.
     blocked_holds: HashMap<String, BlockedHold>,
+    /// Per-agent timestamp of the latest concrete user operation (prompt submit, permission decision, interrupt, review/handoff delivery).
+    user_action_at: HashMap<String, Instant>,
     /// Recently written `herdr.name` labels awaiting Core echo so in-flight listings don't revert renames.
     pending_names: HashMap<String, (String, Instant)>,
     /// Recently written `herdr.trashed` labels awaiting Core echo so in-flight listings don't revert trash/restore.
@@ -1827,6 +1878,7 @@ impl AppWindow {
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
             blocked_holds: HashMap::new(),
+            user_action_at: HashMap::new(),
             pending_names: HashMap::new(),
             pending_trash: HashMap::new(),
             ai_terminal_states: HashMap::new(),
@@ -3901,11 +3953,18 @@ impl AppWindow {
             let live_rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
             let semantic_title = live_rec.and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
             let micro_summary = live_rec.and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
+            let eff_status = m.status(addr).unwrap_or("idle");
+            let (status_source, status_kind, status_reason) = self.status_presentation_meta(addr, Some(eff_status));
             agents.push(json!({
                 "address": addr, "acp": is_acp, "pane": Value::Null, "space": space_id, "space_name": space_name,
                 "tab": Value::Null, "tab_index": 0, "tab_name": "headless",
-                "status": m.status(addr).unwrap_or("idle"),
+                "status": eff_status,
                 "manual_status": a.and_then(|a| a.manual_status.clone()),
+                "status_source": status_source,
+                "status_kind": status_kind,
+                "status_reason": status_reason,
+                "ai_status_kind": status_kind,
+                "ai_status_summary": status_reason,
                 "app": app, "program": self.program(addr), "title": title,
                 "custom_name": custom_name,
                 "semantic_title": semantic_title,
@@ -3934,13 +3993,22 @@ impl AppWindow {
                         let live_rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
                         let semantic_title = live_rec.and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
                         let micro_summary = live_rec.and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                        let manual_status = a.and_then(|a| a.manual_status.clone());
+                        let (status_source, status_kind, status_reason) = self.status_presentation_meta(addr, Some(status));
                         panes.push(json!({
                             "pane": p.id, "acp": true, "mod": "peek", "terminal": addr, "tab": ctx.id, "title": title,
                             "custom_name": custom_name,
                             "semantic_title": semantic_title,
                             "micro_summary": micro_summary,
                             "cwd": cwd, "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
-                            "status": status, "app": app, "program": self.program(addr),
+                            "status": status,
+                            "manual_status": manual_status,
+                            "status_source": status_source,
+                            "status_kind": status_kind,
+                            "status_reason": status_reason,
+                            "ai_status_kind": status_kind,
+                            "ai_status_summary": status_reason,
+                            "app": app, "program": self.program(addr),
                             "context_usage": context_usage,
                             "working_since": working_since,
                             "work_ms": work_ms,
@@ -3953,7 +4021,12 @@ impl AppWindow {
                                 "address": addr, "acp": true, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
                                 "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
                                 "status": status,
-                                "manual_status": a.and_then(|a| a.manual_status.clone()),
+                                "manual_status": manual_status,
+                                "status_source": status_source,
+                                "status_kind": status_kind,
+                                "status_reason": status_reason,
+                                "ai_status_kind": status_kind,
+                                "ai_status_summary": status_reason,
                                 "app": app, "program": self.program(addr), "title": title,
                                 "custom_name": custom_name,
                                 "semantic_title": semantic_title,
@@ -3999,13 +4072,24 @@ impl AppWindow {
                     let semantic_title = self.live.get(addr).and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     let micro_summary = self.live.get(addr).and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     let (working_since, work_ms, total_work_ms) = agent_timing(addr);
+                    let pane_status = m.status(addr);
+                    let manual_status = a.and_then(|a| a.manual_status.clone());
+                    let (pane_status_source, pane_status_kind, pane_status_reason) =
+                        self.status_presentation_meta(addr, pane_status);
                     panes.push(json!({
                         "pane": p.id, "terminal": addr, "tab": ctx.id, "title": title.clone().unwrap_or_default(),
                         "custom_name": custom_name,
                         "semantic_title": semantic_title,
                         "micro_summary": micro_summary,
                         "cwd": self.cwds.get(addr), "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
-                        "status": m.status(addr), "app": a.and_then(|a| a.app.clone()), "program": self.program(addr),
+                        "status": pane_status,
+                        "manual_status": manual_status,
+                        "status_source": pane_status_source,
+                        "status_kind": pane_status_kind,
+                        "status_reason": pane_status_reason,
+                        "ai_status_kind": pane_status_kind,
+                        "ai_status_summary": pane_status_reason,
+                        "app": a.and_then(|a| a.app.clone()), "program": self.program(addr),
                         "structured": structured,
                         "working_since": working_since,
                         "work_ms": work_ms,
@@ -4015,19 +4099,24 @@ impl AppWindow {
                     if self.closing_terminals.contains_key(addr) || self.live.get(addr).is_some_and(is_trashed_record) {
                         continue;
                     }
-                    let Some(status) = m
-                        .status(addr)
+                    let Some(status) = pane_status
                         .or_else(|| has_live_child(addr, &self.live, &self.closing_terminals).then_some("idle"))
                         .or_else(|| self.is_agent_pty(addr).then_some("idle"))
                     else {
                         continue;
                     };
+                    let (status_source, status_kind, status_reason) = self.status_presentation_meta(addr, Some(status));
                     let created_ms = agent_appeared_ms(addr);
                     agents.push(json!({
                         "address": addr, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
                         "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
                         "status": status,
-                        "manual_status": a.and_then(|a| a.manual_status.clone()),
+                        "manual_status": manual_status,
+                        "status_source": status_source,
+                        "status_kind": status_kind,
+                        "status_reason": status_reason,
+                        "ai_status_kind": status_kind,
+                        "ai_status_summary": status_reason,
                         "app": a.and_then(|a| a.app.clone()), "program": self.program(addr), "title": title.unwrap_or_default(),
                         "custom_name": custom_name,
                         "semantic_title": semantic_title,
@@ -4655,21 +4744,181 @@ impl AppWindow {
         Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.name", effective.to_owned(), cx);
     }
 
+    /// Resolves canonical `(status_source, status_kind, status_reason)` for an agent/terminal
+    /// so sidebar rows, pane headers, peek, tabs, and briefing share one coherent explanation.
+    fn status_presentation_meta(
+        &self,
+        addr: &str,
+        effective_status: Option<&str>,
+    ) -> (Option<&'static str>, Option<String>, Option<String>) {
+        let Some(eff) = effective_status else {
+            return (None, None, None);
+        };
+        if eff == "ended" {
+            return (Some("protocol"), None, None);
+        }
+        let manual = self
+            .model
+            .agents
+            .get(addr)
+            .and_then(|a| a.manual_status.as_deref())
+            .or_else(|| self.live.get(addr).and_then(|r| r.get("manual_status")).and_then(Value::as_str))
+            .filter(|s| !s.is_empty());
+        if manual.is_some() {
+            return (Some("manual"), None, None);
+        }
+        let Some(rec) = self.live.get(addr) else {
+            return (Some("protocol"), None, None);
+        };
+        let is_acp = is_acp_addr(addr) || rec.get("acp").and_then(Value::as_bool) == Some(true);
+        let is_reported = is_acp || rec.get("reported").and_then(Value::as_bool) == Some(true);
+
+        if eff == "blocked"
+            && let Some(perm) = rec.get("pending_permission").filter(|v| v.is_object())
+        {
+            let title = perm.get("title").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+            return (Some("permission"), Some("permission".into()), title);
+        }
+        if eff == "blocked"
+            && let Some(hold) = self.blocked_holds.get(addr)
+        {
+            let kind = hold
+                .ai_kind
+                .clone()
+                .or_else(|| rec.pointer("/report/kind").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned));
+            let reason = hold.ai_summary.clone().or_else(|| {
+                rec.pointer("/report/msg")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.starts_with("approval needed"))
+                    .map(str::to_owned)
+            });
+            return (Some(hold.source), kind, reason);
+        }
+        let ai_kind = rec.get("ai_status_kind").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let ai_summary = rec.get("ai_status_summary").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        if ai_summary.is_some() || ai_kind.is_some() {
+            return (Some("ai"), ai_kind, ai_summary);
+        }
+        let rep_kind = rec.pointer("/report/kind").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let rep_msg = rec
+            .pointer("/report/msg")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with("approval needed"))
+            .map(str::to_owned);
+        if rep_msg.is_some() || rep_kind.is_some() {
+            let src = if is_acp && matches!(rep_kind.as_deref(), Some("question" | "auth")) {
+                "ai"
+            } else {
+                "protocol"
+            };
+            return (Some(src), rep_kind, rep_msg);
+        }
+        let src = if is_reported { "protocol" } else { "inferred" };
+        (Some(src), None, None)
+    }
+
+    fn latest_user_action_at(&self, addr: &str, cx: &App) -> Option<Instant> {
+        let term_action = self
+            .terms
+            .values()
+            .filter(|t| t.address == addr)
+            .filter_map(|t| t.view.read(cx).last_action_at())
+            .max();
+        match (self.user_action_at.get(addr).copied(), term_action) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Records a concrete user operation targeting `addr` (app command or JS `h2` action),
+    /// releasing any `"blocked"` hold and clearing any manual override so live tracking resumes.
+    fn record_user_action(&mut self, addr: &str, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.user_action_at.insert(addr.to_owned(), now);
+        self.release_blocked_hold(addr);
+        let had_manual_entry = self.manual_statuses.remove(addr).is_some_and(|e| e.status.is_some());
+        let had_manual_label = self
+            .live
+            .get(addr)
+            .and_then(|r| r.pointer("/labels/herdr.status"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        if had_manual_entry || had_manual_label {
+            if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
+                obj.insert("manual_status".into(), Value::Null);
+                if let Some(labels) = obj.get_mut("labels").and_then(Value::as_object_mut) {
+                    labels.remove("herdr.status");
+                }
+            }
+            let app = self
+                .live
+                .get(addr)
+                .and_then(|r| {
+                    r.pointer("/report/app")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| r.get("agent").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                        .or_else(|| r.pointer("/program/key").and_then(Value::as_str))
+                })
+                .map(str::to_owned);
+            self.model.set_manual_status(addr, None, app);
+            Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.status", String::new(), cx);
+        }
+    }
+
+    fn drain_mod_interactions(&mut self, cx: &mut Context<Self>) -> HashSet<String> {
+        let mut touched = HashSet::new();
+        for target in mods::take_interacted_agents() {
+            let resolved = if self.live.contains_key(&target) {
+                Some(target)
+            } else {
+                self.live
+                    .keys()
+                    .find(|k| k.rsplit_once('/').is_some_and(|(_, local)| local == target))
+                    .cloned()
+            };
+            if let Some(addr) = resolved {
+                self.record_user_action(&addr, cx);
+                touched.insert(addr);
+            }
+        }
+        touched
+    }
+
     /// Resolves any explicit manual status override (`herdr.status`) for `addr`.
-    /// Manual status remains pinned until the user explicitly switches it back to `"auto"`
-    /// (or the CLI agent exits back to shell / closes).
-    fn resolve_manual_status(&mut self, addr: &str) -> Option<String> {
+    /// Manual status overrides the current snapshot, and automatically releases back to live
+    /// tracking once a concrete new operation occurs on `addr` (or when reset to `"auto"`).
+    fn resolve_manual_status(&mut self, addr: &str, cx: &mut Context<Self>) -> Option<String> {
         let rec = self.live.get(addr)?;
         let label_raw = rec.pointer("/labels/herdr.status").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let cur_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+        let cur_raw_state = rec
+            .get("raw_state")
+            .and_then(Value::as_str)
+            .or_else(|| rec.pointer("/report/state").and_then(Value::as_str))
+            .or_else(|| rec.get("status").and_then(Value::as_str))
+            .map(str::to_owned);
+        let is_reported = is_acp_addr(addr)
+            || rec.get("acp").and_then(Value::as_bool) == Some(true)
+            || rec.get("reported").and_then(Value::as_bool) == Some(true);
+        let cur_action_at = self.latest_user_action_at(addr, cx);
         let now = Instant::now();
 
-        if !self.manual_statuses.contains_key(addr) && !label_raw.is_empty()
+        if !self.manual_statuses.contains_key(addr)
+            && !label_raw.is_empty()
             && let Some((word, _)) = parse_manual_status_label(&label_raw)
         {
             self.manual_statuses.insert(addr.to_owned(), ManualStatus {
                 status: Some(word),
                 set_at: now,
                 label_synced: true,
+                latched_action_at: cur_action_at,
+                latched_turn: cur_turn,
+                latched_raw_state: cur_raw_state.clone(),
             });
         } else if let Some(entry) = self.manual_statuses.get_mut(addr) {
             if !label_raw.is_empty() {
@@ -4680,15 +4929,34 @@ impl AppWindow {
                         entry.status = Some(word);
                         entry.set_at = now;
                         entry.label_synced = true;
+                        entry.latched_action_at = cur_action_at;
+                        entry.latched_turn = cur_turn;
+                        entry.latched_raw_state = cur_raw_state.clone();
                     }
                 }
             } else if entry.status.is_some()
                 && (entry.label_synced || now.saturating_duration_since(entry.set_at) > Duration::from_millis(800))
             {
-                // Explicit reset via core label (e.g. from another window or `h2 label`).
+                // Cleared on core (by a concrete operation or explicit reset).
                 self.manual_statuses.remove(addr);
                 return None;
             }
+        }
+
+        let auto_release = self.manual_statuses.get(addr).is_some_and(|entry| {
+            should_release_manual_status(entry, now, cur_action_at, cur_turn, cur_raw_state.as_deref(), is_reported)
+        });
+        if auto_release {
+            self.manual_statuses.remove(addr);
+            if !label_raw.is_empty() {
+                if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut)
+                    && let Some(labels) = obj.get_mut("labels").and_then(Value::as_object_mut)
+                {
+                    labels.remove("herdr.status");
+                }
+                Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.status", String::new(), cx);
+            }
+            return None;
         }
 
         let st_opt = self.manual_statuses.get(addr).and_then(|e| e.status.clone());
@@ -4698,15 +4966,14 @@ impl AppWindow {
         st_opt
     }
 
-    fn latest_submit_at(&self, addr: &str, cx: &App) -> Option<Instant> {
-        self.terms
-            .values()
-            .filter(|t| t.address == addr)
-            .filter_map(|t| t.view.read(cx).last_submit_at())
-            .max()
-    }
-
-    fn latch_blocked_hold(&mut self, addr: &str, ai_kind: Option<String>, ai_summary: Option<String>, cx: &App) {
+    fn latch_blocked_hold(
+        &mut self,
+        addr: &str,
+        ai_kind: Option<String>,
+        ai_summary: Option<String>,
+        source: &'static str,
+        cx: &App,
+    ) {
         if self.manual_statuses.get(addr).is_some_and(|e| e.status.is_some()) {
             return;
         }
@@ -4721,6 +4988,8 @@ impl AppWindow {
         if !is_acp && !is_agent_prog {
             return;
         }
+        let has_pending_perm = rec.get("pending_permission").is_some_and(Value::is_object);
+        let eff_source = if has_pending_perm { "permission" } else { source };
         if let Some(existing) = self.blocked_holds.get_mut(addr) {
             if ai_kind.is_some() {
                 existing.ai_kind = ai_kind;
@@ -4728,15 +4997,21 @@ impl AppWindow {
             if ai_summary.is_some() {
                 existing.ai_summary = ai_summary;
             }
+            existing.had_pending_permission |= has_pending_perm;
+            if has_pending_perm {
+                existing.source = "permission";
+            }
             return;
         }
-        let latched_submit_at = self.latest_submit_at(addr, cx);
+        let latched_action_at = self.latest_user_action_at(addr, cx);
         let latched_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
         self.blocked_holds.insert(addr.to_owned(), BlockedHold {
             ai_kind,
             ai_summary,
-            latched_submit_at,
+            source: eff_source,
+            latched_action_at,
             latched_turn,
+            had_pending_permission: has_pending_perm,
             is_acp,
         });
     }
@@ -4750,18 +5025,12 @@ impl AppWindow {
         }
     }
 
-    /// Reconciles active `"blocked"` holds against explicit prompt submissions / manual status
-    /// changes, and re-applies still-held `"blocked"` state onto `self.live` so passive events
-    /// (focus, resize, redraw, typing without submitting, bare Enter, list refreshes) can never
-    /// clear or flicker `"blocked"`.
+    /// Reconciles active `"blocked"` holds against concrete user operations / manual status changes,
+    /// and re-applies still-held `"blocked"` state onto `self.live` so passive events (focus, resize,
+    /// redraw, typing unsent drafts, arrow keys, bare Enter on idle, list refreshes) never clear `"blocked"`.
     /// Returns `(released_addrs, live_updated)`.
-    fn reconcile_blocked_holds(&mut self, cx: &App) -> (HashSet<String>, bool) {
-        let mut released: HashSet<String> = HashSet::new();
-        for target in mods::take_interacted_agents() {
-            if self.release_blocked_hold(&target) {
-                released.insert(target);
-            }
-        }
+    fn reconcile_blocked_holds(&mut self, pre_released: HashSet<String>, cx: &App) -> (HashSet<String>, bool) {
+        let mut released: HashSet<String> = pre_released;
         let held_addrs: Vec<String> = self.blocked_holds.keys().cloned().collect();
         for addr in held_addrs {
             let Some(rec) = self.live.get(&addr) else {
@@ -4773,33 +5042,52 @@ impl AppWindow {
             };
             let has_manual = self.manual_statuses.get(&addr).is_some_and(|e| e.status.is_some())
                 || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
-            let cur_submit_at = self.latest_submit_at(&addr, cx);
+            let cur_action_at = self.latest_user_action_at(&addr, cx);
             let cur_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-            if should_release_blocked_hold(hold, has_manual, cur_submit_at, cur_turn) {
+            let cur_has_perm = rec.get("pending_permission").is_some_and(Value::is_object);
+            let cur_raw_state = rec
+                .get("raw_state")
+                .and_then(Value::as_str)
+                .or_else(|| rec.pointer("/report/state").and_then(Value::as_str));
+            let cur_inbox_len = rec.get("inbox_len").and_then(Value::as_u64).unwrap_or(0);
+            if should_release_blocked_hold(
+                hold,
+                has_manual,
+                cur_action_at,
+                cur_turn,
+                cur_has_perm,
+                cur_raw_state,
+                cur_inbox_len,
+            ) {
                 self.release_blocked_hold(&addr);
                 released.insert(addr);
             }
         }
         let mut live_updated = false;
-        let still_held: Vec<(String, Option<String>, Option<String>)> = self
+        let still_held: Vec<(String, Option<String>, Option<String>, &'static str)> = self
             .blocked_holds
             .iter()
-            .map(|(a, h)| (a.clone(), h.ai_kind.clone(), h.ai_summary.clone()))
+            .map(|(a, h)| (a.clone(), h.ai_kind.clone(), h.ai_summary.clone(), h.source))
             .collect();
-        for (addr, ai_kind, ai_summary) in still_held {
+        for (addr, ai_kind, ai_summary, source) in still_held {
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 let want_status = json!("blocked");
+                let want_source = json!(source);
                 let want_kind = ai_kind.as_deref().map_or(Value::Null, |s| json!(s));
                 let want_summary = ai_summary.as_deref().map_or(Value::Null, |s| json!(s));
                 if obj.get("status") != Some(&want_status) {
                     obj.insert("status".into(), want_status);
                     live_updated = true;
                 }
-                if obj.get("ai_status_kind") != Some(&want_kind) {
+                if obj.get("status_source") != Some(&want_source) {
+                    obj.insert("status_source".into(), want_source);
+                    live_updated = true;
+                }
+                if ai_kind.is_some() && obj.get("ai_status_kind") != Some(&want_kind) {
                     obj.insert("ai_status_kind".into(), want_kind);
                     live_updated = true;
                 }
-                if obj.get("ai_status_summary") != Some(&want_summary) {
+                if ai_summary.is_some() && obj.get("ai_status_summary") != Some(&want_summary) {
                     obj.insert("ai_status_summary".into(), want_summary);
                     live_updated = true;
                 }
@@ -4821,6 +5109,7 @@ impl AppWindow {
             output_at: Option<Instant>,
             typed_at: Option<Instant>,
             tail_lines: Vec<String>,
+            last_user_prompt: Option<String>,
             next_rechecks: u8,
             fallback_state: &'static str,
             is_reported: bool,
@@ -4828,7 +5117,7 @@ impl AppWindow {
         let mut updates: Vec<(String, Value, Value, Value, Option<String>, Option<String>)> = Vec::new();
         let mut clear_verdicts: Vec<String> = Vec::new();
         let mut clear_ai_fields: Vec<String> = Vec::new();
-        let mut newly_blocked: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        let mut newly_blocked: Vec<(String, Option<String>, Option<String>, &'static str)> = Vec::new();
         let mut jobs: Vec<ArbitrationJob> = Vec::new();
         let can_ai = self.core.supports_ai() && self.ai_unavailable_until.is_none_or(|until| now >= until);
 
@@ -4936,6 +5225,7 @@ impl AppWindow {
                                 output_at,
                                 typed_at,
                                 tail_lines,
+                                last_user_prompt: v.last_submitted_prompt(),
                                 next_rechecks: 0,
                                 fallback_state: det_default,
                                 is_reported: true,
@@ -5014,6 +5304,7 @@ impl AppWindow {
                                 output_at,
                                 typed_at,
                                 tail_lines,
+                                last_user_prompt: v.last_submitted_prompt(),
                                 next_rechecks,
                                 fallback_state: det,
                                 is_reported: false,
@@ -5054,11 +5345,10 @@ impl AppWindow {
         }
         for (addr, want, want_summary, want_kind, fill_sem, fill_micro) in updates {
             if want.as_str() == Some("blocked") {
-                newly_blocked.push((
-                    addr.clone(),
-                    want_kind.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
-                    want_summary.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
-                ));
+                let kind_opt = want_kind.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                let summary_opt = want_summary.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                let src = if summary_opt.is_some() || kind_opt.is_some() { "ai" } else { "inferred" };
+                newly_blocked.push((addr.clone(), kind_opt, summary_opt, src));
             }
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("status".into(), want);
@@ -5072,8 +5362,8 @@ impl AppWindow {
                 }
             }
         }
-        for (addr, ai_kind, ai_summary) in newly_blocked {
-            self.latch_blocked_hold(&addr, ai_kind, ai_summary, cx);
+        for (addr, ai_kind, ai_summary, src) in newly_blocked {
+            self.latch_blocked_hold(&addr, ai_kind, ai_summary, src, cx);
         }
         for job in jobs {
             self.ai_inflight.insert(job.addr.clone());
@@ -5084,6 +5374,7 @@ impl AppWindow {
                 "program": job.program,
                 "rawTitle": job.raw_title,
                 "tailLines": job.tail_lines,
+                "lastUserPrompt": job.last_user_prompt,
                 "language": language,
             });
             let addr = job.addr;
@@ -5206,7 +5497,7 @@ impl AppWindow {
                         }
                     }
                     if mapped_state == "blocked" {
-                        this.latch_blocked_hold(&addr, hold_kind, hold_summary, cx);
+                        this.latch_blocked_hold(&addr, hold_kind, hold_summary, "ai", cx);
                     }
                     let app = this
                         .live
@@ -5947,10 +6238,33 @@ impl AppWindow {
                 .unwrap_or(&addr)
                 .to_owned();
             let shown = crate::terminal::shown_title(&raw_title).into_owned();
+            let rep_kind = report
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map_or(Value::Null, |s| json!(s));
+            let perm_title = obj
+                .get("pending_permission")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let rep_msg = perm_title
+                .or_else(|| {
+                    report
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.starts_with("approval needed"))
+                })
+                .map_or(Value::Null, |s| json!(s));
             obj.insert("acp".into(), json!(true));
             obj.insert("reported".into(), json!(true));
             obj.insert("raw_state".into(), raw_state.map_or(Value::Null, Value::String));
             obj.insert("status".into(), word);
+            obj.insert("ai_status_kind".into(), rep_kind);
+            obj.insert("ai_status_summary".into(), rep_msg);
             obj.insert("report".into(), report);
             obj.insert("program".into(), prog);
             obj.insert("raw_title".into(), raw_title.into());
@@ -5963,6 +6277,7 @@ impl AppWindow {
         self.shell_child_seen.retain(|a| self.live.contains_key(a));
         self.manual_statuses.retain(|a, _| self.live.contains_key(a));
         self.blocked_holds.retain(|a, _| self.live.contains_key(a));
+        self.user_action_at.retain(|a, _| self.live.contains_key(a));
         let now_pending = Instant::now();
         self.pending_names.retain(|addr, (want, at)| {
             let Some(rec) = self.live.get(addr) else {
@@ -6051,6 +6366,7 @@ impl AppWindow {
                     .is_some_and(|s| !s.is_empty());
                 self.manual_statuses.remove(&addr);
                 self.blocked_holds.remove(&addr);
+                self.user_action_at.remove(&addr);
                 if had_manual_label {
                     Self::write_core_label(self.core.clone(), addr.clone(), "herdr.status", String::new(), cx);
                 }
@@ -6059,6 +6375,9 @@ impl AppWindow {
                     obj.insert("micro_summary".into(), Value::Null);
                     obj.insert("ai_status_summary".into(), Value::Null);
                     obj.insert("ai_status_kind".into(), Value::Null);
+                    obj.insert("status_source".into(), Value::Null);
+                    obj.insert("status_kind".into(), Value::Null);
+                    obj.insert("status_reason".into(), Value::Null);
                     obj.insert("working_since".into(), Value::Null);
                     obj.insert("work_ms".into(), Value::Null);
                     obj.insert("total_work_ms".into(), json!(0));
@@ -6082,7 +6401,7 @@ impl AppWindow {
                 }
                 continue;
             }
-            let manual = self.resolve_manual_status(&addr);
+            let manual = self.resolve_manual_status(&addr, cx);
             if manual.is_some() {
                 self.blocked_holds.remove(&addr);
             }
@@ -6090,7 +6409,8 @@ impl AppWindow {
                 obj.insert("manual_status".into(), manual.as_deref().map_or(Value::Null, |s| json!(s)));
             }
         }
-        let _ = self.reconcile_blocked_holds(cx);
+        let mod_released = self.drain_mod_interactions(cx);
+        let _ = self.reconcile_blocked_holds(mod_released, cx);
         self.refresh_inferred_statuses(cx);
         self.refresh_missing_semantic_digests(cx);
         // A new sub-agent or updated inferred state changes `terminals()`.
@@ -6118,14 +6438,15 @@ impl AppWindow {
                 (addr, alert, looking)
             })
             .collect();
+        let mod_released = self.drain_mod_interactions(cx);
         let addrs: Vec<String> = self.live.keys().cloned().collect();
-        let mut republished = false;
-        let mut manual_released = false;
+        let mut republished = !mod_released.is_empty();
+        let mut manual_released = !mod_released.is_empty();
         for addr in &addrs {
             if self.closing_terminals.contains_key(addr) {
                 continue;
             }
-            let manual = self.resolve_manual_status(addr);
+            let manual = self.resolve_manual_status(addr, cx);
             let prev_manual = self.live.get(addr).and_then(|r| r.get("manual_status")).and_then(Value::as_str).map(str::to_owned);
             if prev_manual != manual {
                 republished = true;
@@ -6137,7 +6458,7 @@ impl AppWindow {
                 }
             }
         }
-        let (released_blocked, blocked_updated) = self.reconcile_blocked_holds(cx);
+        let (released_blocked, blocked_updated) = self.reconcile_blocked_holds(mod_released, cx);
         republished |= blocked_updated;
         if (!listed || manual_released || !released_blocked.is_empty()) && self.refresh_inferred_statuses(cx) {
             republished = true;
@@ -6189,9 +6510,34 @@ impl AppWindow {
                         .map(|v| v.read(cx))
                         .is_some_and(|v| matches!((v.last_output_at(), v.last_submit_at()), (Some(out), Some(sub)) if sub > out));
                 (!submitted_since_output).then(|| {
-                    let ai_kind = rec.get("ai_status_kind").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
-                    let ai_summary = rec.get("ai_status_summary").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
-                    (ai_kind, ai_summary)
+                    let has_perm = rec.get("pending_permission").is_some_and(Value::is_object);
+                    let ai_kind = rec
+                        .get("ai_status_kind")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| rec.pointer("/report/kind").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                        .map(str::to_owned);
+                    let ai_summary = rec
+                        .get("ai_status_summary")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            rec.pointer("/report/msg")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && !s.starts_with("approval needed"))
+                        })
+                        .map(str::to_owned);
+                    let src = if has_perm {
+                        "permission"
+                    } else if ai_summary.is_some() || ai_kind.is_some() {
+                        "ai"
+                    } else if is_acp || rec.get("reported").and_then(Value::as_bool) == Some(true) {
+                        "protocol"
+                    } else {
+                        "inferred"
+                    };
+                    (ai_kind, ai_summary, src)
                 })
             } else {
                 None
@@ -6219,8 +6565,8 @@ impl AppWindow {
             let core_status_ms = rec.get("status_ms").and_then(Value::as_u64);
             let is_starting = rec.get("raw_state").and_then(Value::as_str) == Some("starting") && turn == 0;
             changed |= self.model.sync_core_timing(&addr, core_ws, core_work_ms, core_total_ms, core_status_ms, is_starting);
-            if let Some((ai_kind, ai_summary)) = should_latch_blocked {
-                self.latch_blocked_hold(&addr, ai_kind, ai_summary, cx);
+            if let Some((ai_kind, ai_summary, src)) = should_latch_blocked {
+                self.latch_blocked_hold(&addr, ai_kind, ai_summary, src, cx);
             }
             if let Some(a) = self.model.agents.get(&addr)
                 && let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut)
@@ -9904,11 +10250,22 @@ impl AppWindow {
                     .or_else(|| rec.pointer("/program/key").and_then(Value::as_str))
                     .map(str::to_owned);
                 let next_owned = next.map(str::to_owned);
+                let cur_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+                let cur_raw_state = rec
+                    .get("raw_state")
+                    .and_then(Value::as_str)
+                    .or_else(|| rec.pointer("/report/state").and_then(Value::as_str))
+                    .or_else(|| rec.get("status").and_then(Value::as_str))
+                    .map(str::to_owned);
+                let latched_action_at = self.latest_user_action_at(&t, cx);
                 self.release_blocked_hold(&t);
                 self.manual_statuses.insert(t.clone(), ManualStatus {
                     status: next_owned.clone(),
                     set_at: Instant::now(),
                     label_synced: next.is_none(),
+                    latched_action_at,
+                    latched_turn: cur_turn,
+                    latched_raw_state: cur_raw_state,
                 });
                 if next.is_some() {
                     self.ai_terminal_states.remove(&t);
@@ -10282,7 +10639,7 @@ impl AppWindow {
                                             "level": "info",
                                             "action": { "name": "agent.focus", "args": { "terminal": target } },
                                         });
-                                        this.release_blocked_hold(&target);
+                                        this.record_user_action(&target, cx);
                                         this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
                                         if let Some(ref ov_id) = close_ov {
                                             this.close_overlay(ov_id, window, cx);
@@ -10418,7 +10775,7 @@ impl AppWindow {
                 if focus {
                     self.dispatch("agent.focus", &json!({ "terminal": target }), false, window, cx);
                 }
-                self.release_blocked_hold(&target);
+                self.record_user_action(&target, cx);
                 let core = self.core.clone();
                 let generation = self.core_generation;
                 let target_for_ui = target.clone();
@@ -10462,6 +10819,92 @@ impl AppWindow {
                                 this.command_error("agent.send", &err_msg, window, cx);
                             }
                         }
+                    });
+                })
+                .detach();
+                return;
+            }
+            "agent.approve" | "agent.deny" => {
+                let approve = name == "agent.approve";
+                let target = Self::owned(a, "agent")
+                    .or_else(|| Self::owned(a, "terminal"))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.peeked_agent.clone())
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.shown_agent())
+                    .unwrap_or_default();
+                if target.is_empty() {
+                    return self.fail(format!("{name} needs a target agent"));
+                }
+                let option = Self::owned(a, "option").filter(|s| !s.is_empty());
+                self.record_user_action(&target, cx);
+                if let Some(obj) = self.live.get_mut(&target).and_then(Value::as_object_mut) {
+                    obj.insert("pending_permission".into(), Value::Null);
+                    obj.insert("status".into(), json!("working"));
+                    obj.insert("raw_state".into(), json!("working"));
+                    obj.insert("ai_status_kind".into(), Value::Null);
+                    obj.insert("ai_status_summary".into(), Value::Null);
+                }
+                mods::publish_terminals(self.ordered_live_values());
+                self.sync(window, cx);
+                let method = if approve { "agent.approve" } else { "agent.deny" };
+                let cmd_name = name.to_owned();
+                let mut params = json!({ "agent": target });
+                if let Some(opt_id) = option {
+                    params["option"] = json!(opt_id);
+                }
+                let core = self.core.clone();
+                let generation = self.core_generation;
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move { core.call_timeout(method, params, Duration::from_secs(10)) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if generation != this.core_generation || this.draining {
+                            return;
+                        }
+                        if let Err(e) = res {
+                            let err_msg = format!("{e:#}");
+                            tracing::warn!("{cmd_name} failed: {err_msg}");
+                            this.command_error(&cmd_name, &err_msg, window, cx);
+                        }
+                        this.sync(window, cx);
+                    });
+                })
+                .detach();
+                return;
+            }
+            "agent.interrupt" => {
+                let target = Self::owned(a, "agent")
+                    .or_else(|| Self::owned(a, "terminal"))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.peeked_agent.clone())
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.shown_agent())
+                    .unwrap_or_default();
+                if target.is_empty() {
+                    return self.fail("agent.interrupt needs a target agent or terminal");
+                }
+                self.record_user_action(&target, cx);
+                let core = self.core.clone();
+                let generation = self.core_generation;
+                let params = json!({ "agent": target });
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move { core.call_timeout("agent.interrupt", params, Duration::from_secs(12)) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if generation != this.core_generation || this.draining {
+                            return;
+                        }
+                        if let Err(e) = res {
+                            let err_msg = format!("{e:#}");
+                            tracing::warn!("agent.interrupt failed: {err_msg}");
+                            this.command_error("agent.interrupt", &err_msg, window, cx);
+                        }
+                        this.sync(window, cx);
                     });
                 })
                 .detach();
@@ -10574,7 +11017,7 @@ impl AppWindow {
                                         "level": "success",
                                         "action": { "name": "agent.focus", "args": { "terminal": resolved_target } },
                                     });
-                                    this.release_blocked_hold(&resolved_target);
+                                    this.record_user_action(&resolved_target, cx);
                                     this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
                                     if focus_after {
                                         this.dispatch("agent.focus", &json!({ "terminal": resolved_target }), false, window, cx);
@@ -16956,48 +17399,73 @@ export default class SystemToast extends View {
     }
 
     #[test]
-    fn blocked_hold_stays_locked_until_prompt_submit_or_manual_status_change() {
+    fn blocked_hold_and_manual_status_follow_strict_user_operation_gates() {
         let t0 = std::time::Instant::now();
         let t1 = t0 + std::time::Duration::from_millis(50);
+        let t_settled = t0 + std::time::Duration::from_millis(1200);
 
         // 1. PTY agent latched as blocked: passive events, typing without submitting, bare Enter,
         //    and automatic turn increments MUST NOT release.
         let pty_hold = super::BlockedHold {
             ai_kind: Some("question".into()),
             ai_summary: Some("Confirm deploy?".into()),
-            latched_submit_at: Some(t0),
+            source: "ai",
+            latched_action_at: Some(t0),
             latched_turn: 3,
+            had_pending_permission: false,
             is_acp: false,
         };
-        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 3));
-        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 4));
-        assert!(!super::should_release_blocked_hold(&pty_hold, false, None, 3));
-        // User types a prompt in the input box and submits it -> releases hold.
-        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t1), 3));
-        // User manually changes status -> releases hold.
-        assert!(super::should_release_blocked_hold(&pty_hold, true, Some(t0), 3));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 3, false, None, 0));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 4, false, Some("working"), 0));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, None, 3, false, None, 0));
+        // Concrete user operation (prompt submit or TUI confirmation key) -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t1), 3, false, None, 0));
+        // Manual status override -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, true, Some(t0), 3, false, None, 0));
 
-        // 2. PTY agent latched before any submission (latched_submit_at == None): first non-empty submit releases.
+        // 2. PTY agent latched before any user action (`latched_action_at == None`): first concrete action releases.
         let pty_fresh = super::BlockedHold {
             ai_kind: None,
             ai_summary: None,
-            latched_submit_at: None,
+            source: "inferred",
+            latched_action_at: None,
             latched_turn: 0,
+            had_pending_permission: false,
             is_acp: false,
         };
-        assert!(!super::should_release_blocked_hold(&pty_fresh, false, None, 0));
-        assert!(super::should_release_blocked_hold(&pty_fresh, false, Some(t0), 0));
+        assert!(!super::should_release_blocked_hold(&pty_fresh, false, None, 0, false, None, 0));
+        assert!(super::should_release_blocked_hold(&pty_fresh, false, Some(t0), 0, false, None, 0));
 
-        // 3. ACP agent latched as blocked: stays locked until a new prompt turn is submitted or status manually changed.
-        let acp_hold = super::BlockedHold {
-            ai_kind: None,
-            ai_summary: None,
-            latched_submit_at: None,
+        // 3. ACP agent latched on permission or question: passive polls stay locked; permission resolution,
+        //    queued prompt, resumed working state, or new turn releases immediately.
+        let acp_perm_hold = super::BlockedHold {
+            ai_kind: Some("permission".into()),
+            ai_summary: Some("Run cargo test".into()),
+            source: "permission",
+            latched_action_at: None,
             latched_turn: 2,
+            had_pending_permission: true,
             is_acp: true,
         };
-        assert!(!super::should_release_blocked_hold(&acp_hold, false, None, 2));
-        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 3));
-        assert!(super::should_release_blocked_hold(&acp_hold, true, None, 2));
+        assert!(!super::should_release_blocked_hold(&acp_perm_hold, false, None, 2, true, Some("blocked"), 0));
+        assert!(super::should_release_blocked_hold(&acp_perm_hold, false, None, 2, false, Some("working"), 0));
+        assert!(super::should_release_blocked_hold(&acp_perm_hold, false, None, 3, false, Some("idle"), 0));
+        assert!(super::should_release_blocked_hold(&acp_perm_hold, false, None, 2, true, Some("blocked"), 1));
+
+        // 4. Manual status stays locked on passive polls, and releases on a new concrete user operation
+        //    or a newly started reported turn after settling.
+        let manual = super::ManualStatus {
+            status: Some("done".into()),
+            set_at: t0,
+            label_synced: true,
+            latched_action_at: Some(t0),
+            latched_turn: 4,
+            latched_raw_state: Some("idle".into()),
+        };
+        assert!(!super::should_release_manual_status(&manual, t1, Some(t0), 4, Some("idle"), true));
+        assert!(!super::should_release_manual_status(&manual, t_settled, Some(t0), 4, Some("idle"), true));
+        assert!(super::should_release_manual_status(&manual, t1, Some(t1), 4, Some("idle"), false));
+        assert!(super::should_release_manual_status(&manual, t_settled, Some(t0), 5, Some("idle"), true));
+        assert!(super::should_release_manual_status(&manual, t_settled, Some(t0), 4, Some("working"), true));
     }
 }

@@ -251,21 +251,31 @@ export function buildHoverTooltip(agent, rec, { isZh = false, now = Date.now(), 
   const title =
     String(displayLabel || agent?.semantic_title || rec?.semantic_title || cleanTitle(agent?.title || rec?.title) || prog).trim();
 
+  const manual = Boolean(agent?.manual_status || rec?.manual_status);
+  const statusTag = manual
+    ? ` (${tr("manual", "手动")})`
+    : "";
   const headerParts = [title];
   if (prog && prog !== title) headerParts.push(prog);
   if (addr) headerParts.push(addr);
-  headerParts.push(`${statusText}${elapsed}`);
+  headerParts.push(`${statusText}${statusTag}${elapsed}`);
   const line1 = headerParts.join(" · ");
 
-  const permTitle = rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
-  const aiStatusSummary = !agent?.manual_status && typeof (agent?.ai_status_summary ?? rec?.ai_status_summary) === "string"
-    ? String(agent?.ai_status_summary ?? rec?.ai_status_summary).trim()
+  const permTitle = !manual && rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
+  const aiStatusSummary = !manual
+    ? String(agent?.status_reason ?? rec?.status_reason ?? agent?.ai_status_summary ?? rec?.ai_status_summary ?? "").trim()
     : "";
   const micro = String(agent?.micro_summary ?? rec?.micro_summary ?? "").trim();
 
   let progress = "";
-  if (permTitle) {
-    progress = tr(`Waiting approval: ${permTitle}`, `等待审批：${permTitle}`);
+  if (manual) {
+    progress = micro
+      ? `${micro} · ${tr("resumes auto-detect on next action", "新操作后自动恢复识别")}`
+      : tr("Manually set — resumes auto-detect on next action", "已手动设置状态，有新操作后自动恢复识别");
+  } else if (permTitle) {
+    progress = tr(`Waiting approval: ${permTitle} (approve/deny to continue)`, `等待审批：${permTitle}（审批或拒绝后继续）`);
+  } else if (statusKey === "blocked" && aiStatusSummary) {
+    progress = tr(`Needs you: ${aiStatusSummary} (reply or confirm to continue)`, `待确认：${aiStatusSummary}（回复或确认后继续）`);
   } else if (micro) {
     progress = micro;
   } else if (aiStatusSummary) {
@@ -278,7 +288,7 @@ export function buildHoverTooltip(agent, rec, { isZh = false, now = Date.now(), 
   } else if (statusKey === "done") {
     progress = tr("Finished while away — click to inspect", "已完成，点击查看结果与 Diff");
   } else if (statusKey === "blocked") {
-    progress = tr("Paused and waiting for your input", "已暂停，等待你的确认或输入");
+    progress = tr("Paused — reply or confirm to advance", "已暂停，需产生具体确认或输入后继续");
   } else {
     progress = tr("Idle and ready for next prompt", "空闲中，随时可发新指令");
   }
@@ -352,8 +362,12 @@ export function buildLocalFallbackBriefing({
     const isAcp = Boolean(a?.acp ?? rec?.acp);
     const title = resolveSemanticLabel(a, rec, null, null);
     const micro = String(a?.micro_summary ?? rec?.micro_summary ?? "").trim();
-    const aiSummary = !manualStatus ? String(a?.ai_status_summary ?? rec?.ai_status_summary ?? "").trim() : "";
-    const aiKind = !manualStatus ? String(a?.ai_status_kind ?? rec?.ai_status_kind ?? "").trim() : "";
+    const aiSummary = !manualStatus
+      ? String(a?.status_reason ?? rec?.status_reason ?? a?.ai_status_summary ?? rec?.ai_status_summary ?? "").trim()
+      : "";
+    const aiKind = !manualStatus
+      ? String(a?.status_kind ?? rec?.status_kind ?? a?.ai_status_kind ?? rec?.ai_status_kind ?? "").trim()
+      : "";
     const perm = rec?.pending_permission ?? null;
     const spaceName = a?.space_name || rec?.labels?.where || null;
 

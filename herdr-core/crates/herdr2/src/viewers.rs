@@ -326,12 +326,8 @@ impl Core {
         let is_live = st.pty_reg.terminals.get(&id).is_some_and(|t| t.is_live());
         let needs_initial_title =
             st.pty_reg.terminals.get(&id).is_some_and(|t| t.turn > 0 && t.semantic_title.is_none());
-        let is_working = st
-            .pty_reg
-            .terminals
-            .get(&id)
-            .and_then(|t| t.status.as_ref())
-            .is_some_and(|s| s.state == "working");
+        let is_working =
+            st.pty_reg.terminals.get(&id).and_then(|t| t.status.as_ref()).is_some_and(|s| s.state == "working");
         if is_live && (change.turn_ended || change.stuck || first_task_finished) {
             self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(4), None);
         } else if is_live && change.status && (needs_initial_title || is_working) {
@@ -366,6 +362,9 @@ impl Core {
             self.touch(&mut st, conn, channel, |_| {})
         };
         if let Some(id) = id {
+            let had_draft = st.gates.get(&id).is_some_and(crate::pty_input::Gate::has_draft);
+            let is_blocked =
+                st.pty_reg.terminals.get(&id).and_then(|t| t.status.as_ref()).is_some_and(|s| s.state == "blocked");
             let answered = Self::viewer(&mut st, conn, channel).unwrap().1.answers.feed(bytes);
             let mut now = Vec::new();
             let mut from = 0;
@@ -377,9 +376,20 @@ impl Core {
                 now.extend(st.gates.entry(id).or_default().viewer(&waited, false));
                 from = end;
             }
-            now.extend(st.gates.entry(id).or_default().viewer(&bytes[from..], !automatic));
+            let human_tail = &bytes[from..];
+            now.extend(st.gates.entry(id).or_default().viewer(human_tail, !automatic));
+            let concrete_action = !automatic
+                && is_concrete_viewer_operation(
+                    human_tail,
+                    had_draft,
+                    st.gates.get(&id).is_some_and(crate::pty_input::Gate::draft_just_ended),
+                    is_blocked,
+                );
             if let Some(link) = st.link(id) {
                 link.input(id, &now);
+            }
+            if concrete_action {
+                self.clear_manual_status_pty(&mut st, id);
             }
         }
     }
@@ -536,6 +546,46 @@ fn ordered_replies(gate: &mut crate::pty_input::Gate, replies: &[u8]) -> Vec<u8>
     now
 }
 
+/// Returns true when human viewer bytes represent a concrete execution/decision operation
+/// (submitting a non-empty prompt, Ctrl+C interrupt, or answering a blocked confirmation),
+/// ignoring passive focus/mouse events, navigation keys, unsent draft typing, and bare Enter on idle.
+pub(crate) fn is_concrete_viewer_operation(bytes: &[u8], had_draft: bool, draft_ended: bool, is_blocked: bool) -> bool {
+    if bytes.is_empty() || is_passive_mouse_or_focus_only(bytes) {
+        return false;
+    }
+    if bytes.contains(&0x03) {
+        return true;
+    }
+    let has_non_enter_printable = bytes.iter().any(|&b| (0x21..=0x7e).contains(&b) || b >= 0x80);
+    if draft_ended && (had_draft || has_non_enter_printable) {
+        return true;
+    }
+    if is_blocked {
+        return matches!(
+            bytes,
+            b"\r"
+                | b"\n"
+                | b"\r\n"
+                | b" "
+                | b"\x1b"
+                | b"y"
+                | b"Y"
+                | b"n"
+                | b"N"
+                | b"1"
+                | b"2"
+                | b"3"
+                | b"4"
+                | b"5"
+                | b"6"
+                | b"7"
+                | b"8"
+                | b"9"
+        );
+    }
+    false
+}
+
 /// Returns true if `bytes` contains genuine user interaction (keystrokes, clicks, pastes)
 /// rather than passive focus/hover/wheel events.
 #[cfg(test)]
@@ -543,7 +593,6 @@ pub(crate) fn is_user_interaction_input(bytes: &[u8]) -> bool {
     !bytes.is_empty() && !is_passive_mouse_or_focus_only(bytes)
 }
 
-#[cfg(test)]
 fn is_passive_mouse_or_focus_only(mut rest: &[u8]) -> bool {
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix(b"\x1b[I").or_else(|| rest.strip_prefix(b"\x1b[O")) {

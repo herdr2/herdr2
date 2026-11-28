@@ -224,7 +224,7 @@ fn claude_preset_defaults_to_dangerously_skip_permissions() {
 }
 
 #[test]
-fn agent_send_preserves_manual_status_until_explicitly_cleared() {
+fn agent_send_clears_receiver_manual_status_and_preserves_sender() {
     let s = Session::new();
     let a1 = run_fake(&s, &[]);
     let a2 = run_fake(&s, &[]);
@@ -239,10 +239,14 @@ fn agent_send_preserves_manual_status_until_explicitly_cleared() {
 
     let after_a1 = get(&s, &a1);
     let after_a2 = get(&s, &a2);
-    assert_eq!(after_a1["labels"]["herdr.status"], "done", "sender manual status must remain pinned: {after_a1}");
-    assert_eq!(after_a2["labels"]["herdr.status"], "blocked", "receiver manual status must remain pinned: {after_a2}");
+    assert_eq!(after_a1["labels"]["herdr.status"], "done", "sender manual status must remain untouched: {after_a1}");
+    assert!(
+        after_a2["labels"].get("herdr.status").is_none(),
+        "concrete send operation on receiver must clear manual override so real status tracking resumes: {after_a2}"
+    );
+    assert_eq!(after_a2["status"]["state"], "idle", "{after_a2}");
 
-    // Explicit clearing restores auto mode.
+    // Explicit clearing restores auto mode too.
     s.json(&["label", &a1, "herdr.status="]);
     assert!(get(&s, &a1)["labels"].get("herdr.status").is_none());
 }

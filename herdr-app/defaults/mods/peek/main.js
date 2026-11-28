@@ -1943,13 +1943,30 @@ export default class Peek extends View {
   }
 
   statusPill(t, st) {
-    const spinning = st === "working" || st === "starting";
-    const color = t[st] ?? (st === "starting" ? (t.working ?? t.accent) : t.dim);
-    const hasPerm = Boolean(this.term()?.pending_permission);
-    const label = st === "blocked" && hasPerm
+    const rec = this.term();
+    const addr = rec?.address ?? null;
+    const isLive = Boolean(addr) && st !== "ended" && rec?.state !== "finished";
+    const isManual = Boolean(rec?.manual_status);
+    const effSt = isManual ? rec.manual_status : st;
+    const spinning = effSt === "working" || effSt === "starting";
+    const color = t[effSt] ?? (effSt === "starting" ? (t.working ?? t.accent) : t.dim);
+    const permTitle = !isManual && rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
+    const reason = !isManual
+      ? (permTitle || String(rec?.status_reason ?? rec?.ai_status_summary ?? rec?.report?.msg ?? "").trim())
+      : "";
+    const baseLabel = effSt === "blocked" && permTitle
       ? tr("Needs approval", "待审批")
-      : (statusWords()[st] ?? st ?? tr("Offline", "离线"));
+      : (statusWords()[effSt] ?? effSt ?? tr("Offline", "离线"));
+    const tip = [
+      `${tr("Status", "状态")}: ${baseLabel}${isManual ? tr(" (manual · resumes on next action)", "（手动 · 新操作后自动恢复）") : ""}`,
+      reason && !reason.startsWith("approval needed") ? `▸ ${reason}` : "",
+      !isManual && effSt === "blocked"
+        ? tr("Requires your reply, confirmation, or approval to advance", "需产生实际回复、确认或审批操作后进入下一状态")
+        : "",
+      isLive ? tr("Click to change status", "点击切换状态") : "",
+    ].filter(Boolean).join("\n");
     return h_flex()
+      .id("acp-status-pill")
       .h(24)
       .px(9)
       .gap(6)
@@ -1958,13 +1975,25 @@ export default class Peek extends View {
       .flex_none()
       .bg(t.raised)
       .border_1()
-      .border_color(t.border)
+      .border_color(isManual ? (t.accent ?? t.border) : t.border)
       .text_size(11.5)
       .font_medium()
       .text_color(color)
+      .when(isLive, (el) =>
+        el
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .tooltip(tip)
+          .on_mouse_down("left", stopMouse)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            openOverlay({ mod: "agents", kind: "popup", width: 236, height: 244, props: { statusMenu: true, terminal: addr } });
+          }),
+      )
       .when(spinning, (el) => el.child(svg(ICONS.spinner).size(11).text_color(color).spin(900)))
       .when(!spinning, (el) => el.child(div().size(6).rounded(999).bg(color)))
-      .child(label);
+      .child(baseLabel)
+      .when(isManual, (el) => el.child(div().text_size(9.5).font_semibold().text_color(t.accent ?? t.muted).child(tr("M", "手"))));
   }
 
   mdOptions(t, cwd) {

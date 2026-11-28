@@ -6328,7 +6328,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.25"
+    "version": "2.0.26"
   },
   "methods": [
     {
@@ -12477,6 +12477,18 @@
           "required": false,
           "schema": {
             "description": "Preferred UI language (`zh-CN` / `en`) for concise `summary`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional latest user prompt submitted to this session for task-completion context.",
+          "name": "lastUserPrompt",
+          "required": false,
+          "schema": {
+            "description": "Optional latest user prompt submitted to this session for task-completion context.",
             "type": [
               "string",
               "null"

@@ -93,7 +93,7 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
 }
 
 #[test]
-fn viewer_input_preserves_manual_status_override() {
+fn viewer_input_preserves_manual_status_on_passive_or_draft_and_clears_on_concrete_submit() {
     assert!(!is_user_interaction_input(b""));
     assert!(!is_user_interaction_input(b"\x1b[I"));
     assert!(!is_user_interaction_input(b"\x1b[O"));
@@ -123,7 +123,7 @@ fn viewer_input_preserves_manual_status_override() {
             )
             .unwrap();
         st.screens.insert(id, ghostty_vt::Terminal::new(80, 24, 1 << 20));
-        st.pty_reg.terminals.get_mut(&id).unwrap().labels.insert("herdr.status".into(), "blocked@1".into());
+        st.pty_reg.terminals.get_mut(&id).unwrap().labels.insert("herdr.status".into(), "done".into());
         id
     };
     let conn = Arc::new(Conn::default());
@@ -144,15 +144,21 @@ fn viewer_input_preserves_manual_status_override() {
 
     // Passive focus & wheel events must not clear manual status.
     core.viewer_input(&conn, channel, b"\x1b[I\x1b[<64;10;10M", false);
-    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("done"));
 
     // Automatic query answers must not clear manual status.
-    core.viewer_input(&conn, channel, b"y", true);
-    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
+    core.viewer_input(&conn, channel, b"y\r", true);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("done"));
 
-    // Real user keystrokes must also preserve an explicit manual status until the user resets it to auto.
-    core.viewer_input(&conn, channel, b"y\r", false);
-    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
+    // Bare Enter with an empty draft or typing unsent draft characters must not clear manual status.
+    core.viewer_input(&conn, channel, b"\r", false);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("done"));
+    core.viewer_input(&conn, channel, b"fix", false);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("done"));
+
+    // Submitting that non-empty prompt is a concrete new operation and clears manual status back to auto.
+    core.viewer_input(&conn, channel, b"\r", false);
+    assert!(!core.lock().pty_reg.terminals[&id].labels.contains_key("herdr.status"));
 
     drop(core);
     std::fs::remove_dir_all(root).unwrap();

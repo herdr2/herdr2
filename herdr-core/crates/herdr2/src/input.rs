@@ -129,6 +129,7 @@ impl Core {
 
             let Some(session) = st.sessions.get(&id).map(SessionSender::clone_cmd) else {
                 if st.recovering.contains(&id) {
+                    self.clear_manual_status_agent(&mut st, id);
                     let q = st.inboxes.entry(id).or_default();
                     if steer {
                         q.push_front(prompt);
@@ -144,6 +145,7 @@ impl Core {
                 return Err(RpcError::new("unavailable", format!("{agent_addr} has no active ACP session"), ""));
             };
 
+            self.clear_manual_status_agent(&mut st, id);
             let inbox_len = if steer {
                 let _ = session.send(SessionCommand::Steer(prompt));
                 queued_before + 1
@@ -174,18 +176,29 @@ impl Core {
     /// Cancels the active ACP turn via `session/cancel` and waits up to `timeout` for idle/exit.
     pub async fn interrupt(&self, id: u32, timeout: Duration) -> Result<(Interrupted, String), RpcError> {
         {
-            let st = self.lock();
-            let a = st
-                .reg
-                .agents
-                .get(&id)
-                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
-            a.check_program()?;
-            if !a.is_live() {
-                return Ok((Interrupted::Exited, "session/cancel".into()));
-            }
+            let mut st = self.lock();
+            let (was_working, was_stuck) = {
+                let a = st
+                    .reg
+                    .agents
+                    .get(&id)
+                    .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+                a.check_program()?;
+                if !a.is_live() {
+                    return Ok((Interrupted::Exited, "session/cancel".into()));
+                }
+                (working(a), a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "blocked" | "error")))
+            };
+            self.clear_manual_status_agent(&mut st, id);
+            let had_pending_perm = st.pending_perms.contains_key(&id);
             if let Some(session) = st.sessions.get(&id) {
                 let _ = session.cmd_tx.send(SessionCommand::Interrupt);
+            }
+            if !was_working && was_stuck && !had_pending_perm {
+                if let Some(a) = st.reg.agents.get_mut(&id) {
+                    a.pending_permission = None;
+                }
+                self.apply_status(&mut st, id, &crate::status::StatusReport::root("idle"));
             }
         }
         let settled = |st: &State| st.reg.agents.get(&id).is_none_or(|a| !a.is_live() || !working(a));
@@ -299,6 +312,7 @@ impl Core {
         };
         let session = st.sessions.get(&id).map(SessionSender::clone_cmd);
         if let Some(session) = session {
+            self.clear_manual_status_agent(&mut st, id);
             if st.inboxes.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
                 st.inboxes.remove(&id);
             }
@@ -307,6 +321,7 @@ impl Core {
             self.changed.notify_waiters();
             let _ = session.send(SessionCommand::Steer(item));
         } else if st.recovering.contains(&id) {
+            self.clear_manual_status_agent(&mut st, id);
             st.inboxes.entry(id).or_default().push_front(item);
             self.sync_inbox(&mut st, id, true);
             self.save(&st);
@@ -336,6 +351,7 @@ impl Core {
             std::mem::take(&mut a.paused_inbox)
         };
         if !paused.is_empty() {
+            self.clear_manual_status_agent(&mut st, id);
             let queue = st.inboxes.entry(id).or_default();
             for item in paused {
                 let mut prompt = QueuedPrompt::with_attachments(item.text, item.attachments, item.from);

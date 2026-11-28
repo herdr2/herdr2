@@ -32,7 +32,7 @@ Output JSON: {"ack":true}
 
 [OP: pty_status]
 Purpose: Arbitrate the true execution state of a coding agent (interactive PTY CLI screen or finished ACP assistant turn).
-Input fields: `program` (optional CLI/agent name), `raw_title` (terminal title or turn context), `tail` (cleaned trailing lines).
+Input fields: `program` (optional CLI/agent name), `raw_title` (terminal title or turn context), `last_user_prompt` (optional latest user prompt), `tail` (cleaned trailing lines).
 State taxonomy:
 - "working": Agent is actively thinking, streaming, waiting on a long tool/build, or showing an active progress/thinking indicator (e.g., "Thinking...", "Running tests", "Searching", spinner/timer).
 - "blocked": Agent stopped and genuinely requires user input/decision right now BEFORE it can proceed. Set `kind` to:
@@ -45,7 +45,7 @@ State taxonomy:
 Rules:
 - Set "blocked" ONLY when the agent genuinely asks the user a question or awaits approval to proceed; if the agent already finished the requested task, ALWAYS return "done" (never "blocked"), even if it ends with an optional courtesy offer or numbered summary, or if older resolved prompts appear higher in scrollback above an idle prompt.
 - Distinguish actual prompts at the bottom from code snippets or documentation quoted earlier in the screen.
-- Keep `summary` under 20 characters (Chinese) or 40 characters (English), describing specifically what question/approval is awaited or what failed; set null when `idle`/`done`.
+- Keep `summary` under 20 characters (Chinese) or 40 characters (English), stating what question/approval is awaited (`blocked`), what failed (`error`), current step (`working`), or completed outcome (`done`); set null when `idle`.
 - Optionally include `semantic_title` (<= 12 zh / <= 24 en chars) and `micro_summary` (<= 42 zh / <= 90 en chars) for an active or completed task; null when `idle` on a welcome screen or "Recent activity" list.
 Output JSON: {"state":"working|blocked|done|error|idle","kind":"permission|question|auth|null","confidence":0.0,"summary":"...|null","semantic_title":"...|null","micro_summary":"...|null"}
 

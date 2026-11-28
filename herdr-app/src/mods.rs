@@ -1028,8 +1028,9 @@ pub fn take_interacted_agents() -> Vec<String> {
 fn h2_interaction_target(args: &[String]) -> Option<String> {
     let first = args.first()?.as_str();
     let start_idx = match first {
-        "send" => 1,
-        "inbox" if args.get(1).map(String::as_str) == Some("send") => 2,
+        "send" | "approve" | "deny" | "interrupt" | "review" => 1,
+        "inbox" if matches!(args.get(1).map(String::as_str), Some("send" | "resume")) => 2,
+        "checkpoint" if args.get(1).map(String::as_str) == Some("rollback") => 2,
         _ => return None,
     };
     let mut i = start_idx;
@@ -1042,7 +1043,21 @@ fn h2_interaction_target(args: &[String]) -> Option<String> {
             if !flag.contains('=')
                 && matches!(
                     flag,
-                    "option" | "on" | "file" | "timeout" | "only-if" | "from" | "caller" | "image" | "attach" | "model"
+                    "option"
+                        | "on"
+                        | "file"
+                        | "timeout"
+                        | "only-if"
+                        | "from"
+                        | "caller"
+                        | "image"
+                        | "attach"
+                        | "model"
+                        | "to"
+                        | "note"
+                        | "source"
+                        | "repo-root"
+                        | "checkpoint-turn"
                 )
             {
                 i += 2;
@@ -2514,15 +2529,17 @@ mod tests {
     }
 
     #[test]
-    fn h2_interaction_target_extracts_prompt_submit_commands_only() {
+    fn h2_interaction_target_extracts_concrete_user_operations_only() {
         let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(h2_interaction_target(&v(&["send", "--json", "t1", "hello"])), Some("t1".into()));
         assert_eq!(h2_interaction_target(&v(&["send", "--json", "--on", "box", "t2", "hi"])), Some("t2".into()));
         assert_eq!(h2_interaction_target(&v(&["inbox", "send", "--json", "a5", "101"])), Some("a5".into()));
-        assert_eq!(h2_interaction_target(&v(&["approve", "--json", "--option", "allow", "a1"])), None);
-        assert_eq!(h2_interaction_target(&v(&["deny", "--json", "a2"])), None);
-        assert_eq!(h2_interaction_target(&v(&["interrupt", "--json", "box/t3"])), None);
-        assert_eq!(h2_interaction_target(&v(&["keys", "--json", "t4", "enter"])), None);
+        assert_eq!(h2_interaction_target(&v(&["inbox", "resume", "--json", "a6"])), Some("a6".into()));
+        assert_eq!(h2_interaction_target(&v(&["approve", "--json", "--option", "allow", "a1"])), Some("a1".into()));
+        assert_eq!(h2_interaction_target(&v(&["deny", "--json", "a2"])), Some("a2".into()));
+        assert_eq!(h2_interaction_target(&v(&["interrupt", "--json", "box/t3"])), Some("box/t3".into()));
+        assert_eq!(h2_interaction_target(&v(&["checkpoint", "rollback", "--json", "--to", "2", "a4"])), Some("a4".into()));
+        assert_eq!(h2_interaction_target(&v(&["keys", "--json", "t4", "up"])), None);
         assert_eq!(h2_interaction_target(&v(&["read", "--json", "t1"])), None);
         assert_eq!(h2_interaction_target(&v(&["get", "--json", "a1"])), None);
         assert_eq!(h2_interaction_target(&v(&["ls", "--json"])), None);

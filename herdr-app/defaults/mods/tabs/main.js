@@ -181,24 +181,31 @@ function buildTabMicroTooltip(tab, lead, displayName, elapsed, termByAddr) {
     error: tr("Error", "异常"),
     idle: tr("Idle", "空闲"),
   };
+  const isManual = Boolean(lead.manual_status ?? rec?.manual_status);
   const prog = lead.program?.name ?? (lead.acp ? "ACP" : "Terminal");
   const elapsedText = elapsed && elapsed.ms > 0 ? ` ${formatElapsed(elapsed.ms)}` : "";
-  const head = [displayName, prog !== displayName ? prog : "", `${stMap[st] ?? st}${elapsedText}`]
+  const manualTag = isManual ? ` (${tr("manual", "手动")})` : "";
+  const head = [displayName, prog !== displayName ? prog : "", `${stMap[st] ?? st}${manualTag}${elapsedText}`]
     .filter(Boolean)
     .join(" · ");
-  const perm = rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
-  const micro = String(lead.micro_summary ?? rec?.micro_summary ?? rec?.ai_status_summary ?? "").trim();
-  const progress = perm
-    ? tr(`Waiting approval: ${perm}`, `等待审批：${perm}`)
-    : micro
-      ? micro
-      : st === "working"
-        ? tr("Actively working in background…", "后台执行中…")
-        : st === "done"
-          ? tr("Finished — click tab to inspect", "已完成 — 点击标签页检视")
-          : st === "blocked"
-            ? tr("Needs your input or approval", "等待你的确认或输入")
-            : "";
+  const perm = !isManual && rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
+  const reason = !isManual ? String(lead.status_reason ?? rec?.status_reason ?? rec?.ai_status_summary ?? "").trim() : "";
+  const micro = String(lead.micro_summary ?? rec?.micro_summary ?? reason ?? "").trim();
+  const progress = isManual
+    ? (micro ? `${micro} · ${tr("resumes on next action", "新操作后恢复自动识别")}` : tr("Manual status · resumes on next action", "手动设置 · 新操作后自动恢复"))
+    : perm
+      ? tr(`Waiting approval: ${perm}`, `等待审批：${perm}`)
+      : st === "blocked" && reason
+        ? tr(`Needs you: ${reason}`, `待确认：${reason}`)
+        : micro
+          ? micro
+          : st === "working"
+            ? tr("Actively working in background…", "后台执行中…")
+            : st === "done"
+              ? tr("Finished — click tab to inspect", "已完成 — 点击标签页检视")
+              : st === "blocked"
+                ? tr("Needs your input or approval to advance", "需你的确认或输入后进入下一状态")
+                : "";
   const cwd = String(lead.cwd ?? rec?.cwd ?? "").trim();
   const branch = String(lead.branch ?? "").trim();
   const shortCwd = cwd.length > 44 ? `…${cwd.slice(-42)}` : cwd;

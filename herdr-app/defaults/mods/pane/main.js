@@ -189,25 +189,35 @@ function buildWorkSummary(p, term, isAgent, displayName) {
   }
   const st = p.manual_status ?? term?.manual_status ?? p.status ?? term?.status ?? "idle";
   const manual = Boolean(p.manual_status || term?.manual_status);
-  const permTitle = term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
+  const permTitle = !manual && term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
   const micro = String(term?.micro_summary ?? p.micro_summary ?? "").trim();
   const semantic = String(term?.semantic_title ?? p.semantic_title ?? "").trim();
-  const aiSummary = !manual ? String(term?.ai_status_summary ?? p.ai_status_summary ?? "").trim() : "";
+  const aiSummary = !manual
+    ? String(p.status_reason ?? term?.status_reason ?? term?.ai_status_summary ?? p.ai_status_summary ?? "").trim()
+    : "";
+  const statusKind = !manual
+    ? String(p.status_kind ?? term?.status_kind ?? term?.ai_status_kind ?? p.ai_status_kind ?? "").trim()
+    : "";
   const turn = Number(term?.turn ?? 0);
 
   let text = "";
   let tone = "muted";
   const semPrefix = semantic && semantic !== displayName ? `${semantic} · ` : "";
-  if (permTitle && !manual) {
+  if (permTitle) {
     text = tr(`Waiting approval: ${permTitle}`, `等待审批：${permTitle}`);
+    tone = "blocked";
+  } else if (st === "blocked" && aiSummary) {
+    text = statusKind === "error"
+      ? tr(`Error: ${aiSummary}`, `异常：${aiSummary}`)
+      : tr(`Needs you: ${aiSummary}`, `待确认：${aiSummary}`);
     tone = "blocked";
   } else if (micro) {
     const prefix = semPrefix && !micro.startsWith(semantic) ? semPrefix : "";
     text = `${prefix}${micro}`;
     tone = st === "working" ? "working" : st === "blocked" ? "blocked" : st === "done" ? "done" : "muted";
   } else if (aiSummary) {
-    text = aiSummary;
-    tone = st === "blocked" ? "blocked" : "muted";
+    text = `${semPrefix}${aiSummary}`;
+    tone = st === "blocked" ? "blocked" : st === "done" ? "done" : st === "working" ? "working" : "muted";
   } else if (st === "working") {
     const base = turn > 0
       ? tr(`Working on turn ${turn}…`, `正在执行中（第 ${turn} 轮）…`)
@@ -218,7 +228,7 @@ function buildWorkSummary(p, term, isAgent, displayName) {
     text = `${semPrefix}${tr("Completed — ready to inspect changes", "本轮已完成，可检视改动 Diff")}`;
     tone = "done";
   } else if (st === "blocked") {
-    text = `${semPrefix}${tr("Paused — waiting for your input or confirmation", "已暂停，等待你的输入或确认")}`;
+    text = `${semPrefix}${tr("Paused — reply or confirm to advance", "已暂停，需你的具体确认或输入后继续")}`;
     tone = "blocked";
   } else if (st === "ended") {
     text = tr("Session ended", "会话已结束");
@@ -233,6 +243,11 @@ function buildWorkSummary(p, term, isAgent, displayName) {
   const tipLines = [];
   if (semantic) tipLines.push(tr(`Task: ${semantic}`, `任务：${semantic}`));
   tipLines.push(text);
+  if (manual) {
+    tipLines.push(tr("Manual status · resumes auto-detect on next action", "手动设置状态 · 有新操作后自动恢复实时识别"));
+  } else if (st === "blocked") {
+    tipLines.push(tr("Locked until you submit a reply, confirm, or approve", "待确认锁定中 · 产生具体操作后自动进入下一状态"));
+  }
   if (turn > 0) tipLines.push(tr(`Turn ${turn}`, `当前第 ${turn} 轮`));
   return { text, tone, tooltip: tipLines.join("\n") };
 }
@@ -900,7 +915,6 @@ export default class Pane extends View {
           .child(svg("mods/workspace-chrome/clock.svg").size(10.5).flex_none())
           .child(formatElapsed(elapsed.ms)),
       ))
-      .when(st === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .when(isStructured && st === "working" && Boolean(p.terminal), el =>
         el.child(
           div()
@@ -926,8 +940,73 @@ export default class Pane extends View {
         ),
       )
       .when(st === "ended", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.raised).border_1().border_color(t.border).text_size(10.5).font_medium().text_color(t.muted).child(tr("Ended", "已结束"))))
-      .when(st === "blocked", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child(tr("Needs you", "待确认"))))
-      .when(st === "done", el => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
+      .when(isAgent && Boolean(st) && st !== "ended" && Boolean(p.terminal), el => {
+        const isManual = Boolean(p.manual_status || term?.manual_status);
+        const permTitle = !isManual && term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
+        const statusReason = !isManual
+          ? (permTitle || String(p.status_reason ?? term?.status_reason ?? term?.ai_status_summary ?? p.ai_status_summary ?? "").trim())
+          : "";
+        const statusKind = !isManual
+          ? String(p.status_kind ?? term?.status_kind ?? term?.ai_status_kind ?? p.ai_status_kind ?? "").trim()
+          : "";
+        const stColor = t[st] ?? t.dim;
+        const stNames = {
+          working: tr("Working", "运行中"),
+          blocked: statusKind === "error"
+            ? tr("Error", "异常")
+            : permTitle || statusKind === "permission"
+              ? tr("Needs approval", "待审批")
+              : tr("Needs you", "待确认"),
+          done: tr("Done", "已完成"),
+          idle: tr("Idle", "空闲"),
+        };
+        const pillText = st === "blocked" && statusReason
+          ? statusReason
+          : (stNames[st] ?? st);
+        const showPillLabel = st === "blocked" || st === "done" || isManual;
+        const stTip = [
+          `${tr("Status", "状态")}: ${stNames[st] ?? st}${isManual ? tr(" (manual · resumes on next action)", "（手动 · 新操作后自动恢复）") : ""}`,
+          statusReason ? `▸ ${statusReason}` : "",
+          !isManual && st === "blocked"
+            ? tr("Requires your reply, confirmation, or approval to advance", "需产生实际回复、确认或审批操作后进入下一状态")
+            : "",
+          tr("Click to change status", "点击切换状态"),
+        ].filter(Boolean).join("\n");
+        return el.child(
+          h_flex()
+            .id(`ph-status-${pane}`)
+            .flex_none()
+            .h(18)
+            .px(showPillLabel ? 6 : 5)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg(st === "blocked" ? (alpha(t.blocked, "26") ?? t.raised) : st === "done" ? (alpha(t.done, "1f") ?? t.raised) : t.raised)
+            .border_1()
+            .border_color(isManual ? (t.accent ?? t.border) : st === "blocked" ? (alpha(t.blocked, "55") ?? t.border) : t.border)
+            .text_size(10.5)
+            .font_medium()
+            .text_color(st === "idle" ? t.muted : stColor)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .tooltip(stTip)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              openOverlay({ mod: "agents", kind: "popup", width: 236, height: 244, props: { statusMenu: true, terminal: p.terminal } });
+            })
+            .when(st === "working", (b) => b.child(svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().text_color(t.working).spin(900)))
+            .when(st !== "working", (b) =>
+              b.child(
+                st === "idle"
+                  ? div().size(6).flex_none().rounded(3).border(1.5).border_color(t.idle ?? t.dim)
+                  : div().size(6).flex_none().rounded(3).bg(stColor),
+              ),
+            )
+            .when(showPillLabel, (b) => b.child(div().max_w(130).truncate().child(pillText)))
+            .when(isManual, (b) => b.child(div().text_size(9.5).font_semibold().text_color(t.accent ?? t.muted).child(tr("M", "手")))),
+        );
+      })
       .when(this.hovered || isStructured, el => el
         .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, withShortcut(tr("Split right", "向右分栏"), "pane.split:right")))
         .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, withShortcut(tr("Split down", "向下分栏"), "pane.split:down")))

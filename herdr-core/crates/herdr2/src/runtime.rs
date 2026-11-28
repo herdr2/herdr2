@@ -390,6 +390,38 @@ impl Core {
         }
     }
 
+    /// Clears any manual `herdr.status` override on an ACP agent once a concrete new operation
+    /// targets it, emitting a `"labels"` event so connected UIs immediately resume live tracking.
+    pub fn clear_manual_status_agent(&self, st: &mut State, id: u32) -> bool {
+        let was = st.reg.agents.get(&id).cloned();
+        let Some(a) = st.reg.agents.get_mut(&id) else {
+            return false;
+        };
+        if a.labels.remove("herdr.status").is_none() {
+            return false;
+        }
+        let labels = serde_json::to_value(&a.labels).unwrap_or_default();
+        self.emit_from(st, "labels", id, serde_json::json!({ "labels": labels }), was.as_ref());
+        self.save_soon();
+        true
+    }
+
+    /// Clears any manual `herdr.status` override on a PTY terminal once a concrete new operation
+    /// targets it, emitting a `"labels"` event so connected UIs immediately resume live tracking.
+    pub fn clear_manual_status_pty(&self, st: &mut State, id: u32) -> bool {
+        let was = st.pty_reg.terminals.get(&id).cloned();
+        let Some(t) = st.pty_reg.terminals.get_mut(&id) else {
+            return false;
+        };
+        if t.labels.remove("herdr.status").is_none() {
+            return false;
+        }
+        let labels = serde_json::to_value(&t.labels).unwrap_or_default();
+        self.emit_pty_from(st, "labels", id, serde_json::json!({ "labels": labels }), was.as_ref());
+        self.save_pty_soon();
+        true
+    }
+
     pub fn apply_status(&self, st: &mut State, id: u32, report: &StatusReport) {
         let word = |st: &State| st.reg.agents.get(&id).and_then(|a| a.status.as_ref().map(|s| s.state.clone()));
         let was = word(st);
@@ -610,15 +642,20 @@ impl Core {
             if assistant_text.trim().is_empty() {
                 return;
             }
+            let last_user_prompt = entries.iter().rev().find_map(|e| match e {
+                Entry::User { turn, text, .. } if *turn == turn_num => Some(crate::transcript::strip_h2_envelope(text)),
+                _ => None,
+            });
             let is_zh = crate::ai::digest::entries_prefer_zh(entries);
             let program = a.agent.clone().unwrap_or_else(|| "acp".into());
-            (program, assistant_text, is_zh)
+            (program, last_user_prompt, assistant_text, is_zh)
         };
         tokio::spawn(async move {
-            let (program, assistant_text, is_zh) = snapshot;
+            let (program, last_user_prompt, assistant_text, is_zh) = snapshot;
             let verdict = crate::ai::classify_acp_turn_state(
                 &core.ai,
                 &program,
+                last_user_prompt.as_deref(),
                 &assistant_text,
                 Some(if is_zh { "zh" } else { "en" }),
             )
@@ -921,6 +958,7 @@ impl Core {
         if let Some(a) = st.reg.agents.get_mut(&id) {
             a.pending_permission = None;
         }
+        self.clear_manual_status_agent(&mut st, id);
         self.record_transcript(
             &mut st,
             id,

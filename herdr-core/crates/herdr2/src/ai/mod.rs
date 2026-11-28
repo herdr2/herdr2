@@ -25,15 +25,14 @@ pub use briefing::{
 };
 pub use client::{AiModelsResult, AiProtocol, AiTestResult, allows_keyless_url};
 pub use config::{
-    AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language,
-    normalize_prompt_mode, now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
-    read_app_settings_language, validate_http_url, write_secret_file,
+    AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language, normalize_prompt_mode,
+    now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code, read_app_settings_language,
+    validate_http_url, write_secret_file,
 };
 pub use digest::{
     AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, PolishContextInput,
-    PolishPromptParams, PolishPromptResult, PolishSessionContext, SummarizeAgentParams,
-    build_deterministic_acp_digest, build_polish_session_context, generate_commit_message, polish_prompt,
-    refine_agent_digest,
+    PolishPromptParams, PolishPromptResult, PolishSessionContext, SummarizeAgentParams, build_deterministic_acp_digest,
+    build_polish_session_context, generate_commit_message, polish_prompt, refine_agent_digest,
 };
 pub use handoff_ai::{
     HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns, recommend_handoff,
@@ -758,7 +757,8 @@ impl AiRuntime {
         let cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let has_key = key.is_some();
         let is_local = is_loopback_http_url(&cfg.base_url);
-        let configured = cfg.enabled && !cfg.base_url.trim().is_empty() && (has_key || allows_keyless_url(&cfg.base_url));
+        let configured =
+            cfg.enabled && !cfg.base_url.trim().is_empty() && (has_key || allows_keyless_url(&cfg.base_url));
         let key_source = if has_key {
             src.to_string()
         } else if is_local && !cfg.base_url.trim().is_empty() {
@@ -782,11 +782,7 @@ impl AiRuntime {
         let resolved_prompt_mode = cfg.resolved_prompt_mode();
         let active_caps = if !active_base.is_empty() && !active_model.is_empty() {
             let cap_key = format!("{active_base}|{active_model}");
-            self.endpoint_caps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&cap_key)
-                .copied()
+            self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner()).get(&cap_key).copied()
         } else {
             None
         };
@@ -933,8 +929,7 @@ impl AiRuntime {
             key_changed = true;
         }
 
-        let url_changed =
-            next.base_url.trim().trim_end_matches('/') != prev.base_url.trim().trim_end_matches('/');
+        let url_changed = next.base_url.trim().trim_end_matches('/') != prev.base_url.trim().trim_end_matches('/');
         let model_changed = next.model.trim() != prev.model.trim();
         // When the user switches model (without explicitly pinning a prompt mode in the same call),
         // reset prompt_mode to "auto" so the runtime re-detects KV-cache support for the new model.
@@ -1078,9 +1073,8 @@ impl AiRuntime {
         let target_norm = base_url.trim().trim_end_matches('/');
         let same_as_saved = !saved_norm.is_empty() && target_norm == saved_norm;
         let (stored_key, _) = read_ai_key(&self.paths);
-        let key = key_override
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| if same_as_saved { stored_key } else { None });
+        let key =
+            key_override.filter(|s| !s.trim().is_empty()).or_else(|| if same_as_saved { stored_key } else { None });
         let res = fetch_ai_models_detailed(&base_url, key.as_deref()).await;
         if res.ok && !res.models.is_empty() && same_as_saved {
             self.update_models(&res.base_url, res.models.clone());
@@ -1103,9 +1097,8 @@ impl AiRuntime {
         let target_norm = base_url.trim().trim_end_matches('/');
         let same_as_saved = !saved_norm.is_empty() && target_norm == saved_norm;
         let (stored_key, _) = read_ai_key(&self.paths);
-        let key = key_override
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| if same_as_saved { stored_key } else { None });
+        let key =
+            key_override.filter(|s| !s.trim().is_empty()).or_else(|| if same_as_saved { stored_key } else { None });
         let model = model_override
             .filter(|s| !s.trim().is_empty())
             .or_else(|| (same_as_saved && !cfg.model.trim().is_empty()).then_some(cfg.model));
@@ -1766,9 +1759,8 @@ impl AiRuntime {
                         if caps != initial_caps {
                             let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
                             map.insert(cap_key.clone(), caps);
-                            let base_entry = map
-                                .entry(base.clone())
-                                .or_insert_with(|| EndpointCapabilities::default_for_url(&base));
+                            let base_entry =
+                                map.entry(base.clone()).or_insert_with(|| EndpointCapabilities::default_for_url(&base));
                             base_entry.protocol = Some(proto);
                             base_entry.anthropic_bearer_auth = caps.anthropic_bearer_auth;
                             save_endpoint_caps(&self.paths, &map);
@@ -2641,10 +2633,7 @@ mod tests {
 
         // B. Switch to explicit "shared_prefix" -> stays long prefix even after 6 zero-cache calls
         let st = rt
-            .update_settings(AiSettingsSetParams {
-                prompt_mode: Some("shared_prefix".into()),
-                ..Default::default()
-            })
+            .update_settings(AiSettingsSetParams { prompt_mode: Some("shared_prefix".into()), ..Default::default() })
             .await
             .unwrap();
         assert_eq!(st.switches.prompt_mode, "shared_prefix");
@@ -2669,10 +2658,7 @@ mod tests {
 
         // C. Switching model automatically resets prompt_mode to "auto" and clears detection records
         let st_switched = rt
-            .update_settings(AiSettingsSetParams {
-                model: Some("model-b".into()),
-                ..Default::default()
-            })
+            .update_settings(AiSettingsSetParams { model: Some("model-b".into()), ..Default::default() })
             .await
             .unwrap();
         assert_eq!(st_switched.model, "model-b");
@@ -3179,6 +3165,7 @@ mod tests {
         let r1 = classify_acp_turn_state(
             &rt,
             "claude",
+            Some("请帮我重构登录流程"),
             "目前有方案一和方案二，各自利弊如上，先等你拍板后再开始改代码。",
             Some("zh"),
         )
@@ -3191,6 +3178,7 @@ mod tests {
         let r1_cached = classify_acp_turn_state(
             &rt,
             "claude",
+            Some("请帮我重构登录流程"),
             "目前有方案一和方案二，各自利弊如上，先等你拍板后再开始改代码。",
             Some("zh"),
         )
@@ -3198,7 +3186,14 @@ mod tests {
         assert!(r1_cached.used_ai && r1_cached.accepted && r1_cached.from_cache);
 
         // Rhetorical question in a completed summary -> AI corrects to done.
-        let r2 = classify_acp_turn_state(&rt, "claude", "为什么之前会超时？因为锁未释放，现已彻底修复并通过测试。", Some("zh")).await;
+        let r2 = classify_acp_turn_state(
+            &rt,
+            "claude",
+            Some("排查一下超时原因并修复"),
+            "为什么之前会超时？因为锁未释放，现已彻底修复并通过测试。",
+            Some("zh"),
+        )
+        .await;
         assert!(r2.used_ai && r2.accepted && !r2.from_cache);
         assert_eq!(r2.state.as_deref(), Some("done"));
 

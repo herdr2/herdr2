@@ -14,9 +14,9 @@ use crate::runtime::{Core, Exit};
 use crate::status::StatusReport;
 use crate::transcript::{Attachment, Entry};
 use proto::{
-    AcpAvailableCommand, AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams,
-    InitializeResult, ParsedUpdate, PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams,
-    SessionNewResult, SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
+    AcpAvailableCommand, AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams, InitializeResult,
+    ParsedUpdate, PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult,
+    SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
     SessionSetModelParams, StdioMcpServer, parse_available_commands, parse_request_permission, parse_session_config,
     parse_session_update, permission_cancelled, permission_selected,
 };
@@ -738,7 +738,8 @@ async fn setup_session(
         {
             env.push(EnvVar { name: "H2_SESSION".into(), value: sess });
         }
-        for k in ["H2_DROVE_URL", "H2_DROVE_WORKER_TOKEN", "H2_DROVE_WORKER_TICKET", "H2_DROVE_WORKER_ID", "H2_DROVE_RUN_ID"]
+        for k in
+            ["H2_DROVE_URL", "H2_DROVE_WORKER_TOKEN", "H2_DROVE_WORKER_TICKET", "H2_DROVE_WORKER_ID", "H2_DROVE_RUN_ID"]
         {
             if let Some(v) = spec.env.get(k).filter(|s| !s.is_empty()) {
                 env.push(EnvVar { name: k.into(), value: v.clone() });
@@ -1054,6 +1055,7 @@ async fn run_actor(
             let wire_text = prepare_acp_prompt(&core, id, expected_turn, &prompt.text, &clean_prompt).await;
             let turn_num = begin_turn(&core, id, &prompt);
             let mut downgraded = false;
+            let mut turn_cancelled = false;
 
             let outcome = loop {
                 let (wire_blocks, used_rich) =
@@ -1062,9 +1064,22 @@ async fn run_actor(
                 let prompt_fut = transport.request("session/prompt", &req, TURN_TIMEOUT);
                 tokio::pin!(prompt_fut);
                 let mut cancel_sent = false;
+                let mut cancel_retried = false;
 
                 let attempt = loop {
+                    let retry_cancel = async {
+                        if cancel_sent && !cancel_retried {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    };
                     tokio::select! {
+                        biased;
+                        exited = &mut exit_fut => {
+                            finish_exit(&core, id, token, exited);
+                            return;
+                        }
                         res = &mut prompt_fut => break Some(res),
                         msg = started.inbound_rx.recv() => match msg {
                             Some(Inbound::Update(params)) => {
@@ -1084,6 +1099,7 @@ async fn run_actor(
                         cmd = cmd_rx.recv() => match cmd {
                             Some(SessionCommand::WakeInbox) => {}
                             Some(SessionCommand::Interrupt) => {
+                                turn_cancelled = true;
                                 cancel_pending_perm(&core, id, turn_num);
                                 if !cancel_sent {
                                     let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
@@ -1091,6 +1107,7 @@ async fn run_actor(
                                 }
                             }
                             Some(SessionCommand::Steer(next)) => {
+                                turn_cancelled = true;
                                 push_front_prompt(&core, id, next);
                                 cancel_pending_perm(&core, id, turn_num);
                                 if !cancel_sent {
@@ -1106,9 +1123,9 @@ async fn run_actor(
                                 break None;
                             }
                         },
-                        exited = &mut exit_fut => {
-                            finish_exit(&core, id, token, exited);
-                            return;
+                        () = retry_cancel => {
+                            cancel_retried = true;
+                            let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
                         }
                     }
                 };
@@ -1166,7 +1183,18 @@ async fn run_actor(
                         .await;
                     }
                 }
-                finish_turn(&core, id, turn_num, res);
+                let is_cancelled_result = turn_cancelled
+                    || res.as_ref().is_ok_and(|val| {
+                        serde_json::from_value::<SessionPromptResult>(val.clone())
+                            .map(|p| p.stop_reason.eq_ignore_ascii_case("cancelled"))
+                            .unwrap_or(false)
+                    });
+                let ai_verdict = if res.is_ok() && !is_cancelled_result && session_is_current(&core, id, token) {
+                    arbitrate_acp_turn_before_finish(&core, id, turn_num).await
+                } else {
+                    None
+                };
+                finish_turn(&core, id, turn_num, res, is_cancelled_result, ai_verdict);
             }
             continue;
         }
@@ -1273,7 +1301,8 @@ async fn prepare_acp_prompt(core: &Arc<Core>, id: u32, turn_num: u64, raw_prompt
         )
         .await;
     } else if capture_pre_turn {
-        let _ = crate::checkpoint::capture_pre_turn_baseline(core, crate::runtime::TargetKey::Agent(id), turn_num).await;
+        let _ =
+            crate::checkpoint::capture_pre_turn_baseline(core, crate::runtime::TargetKey::Agent(id), turn_num).await;
     }
 
     match handoff {
@@ -1544,6 +1573,7 @@ pub async fn rollback_acp_agent(
             let _ = crate::status::apply(a, &StatusReport::root("idle"));
             a.turn = to_turn.min(current_turn.max(to_turn));
         }
+        core.clear_manual_status_agent(&mut st, id);
 
         let public = serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone())).unwrap_or_default();
         let rewind_entry = st.transcripts.get(&id).and_then(|t| t.entries().last()).cloned();
@@ -1621,7 +1651,60 @@ fn begin_turn(core: &Core, id: u32, prompt: &QueuedPrompt) -> u64 {
     turn_num
 }
 
-fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError>) {
+async fn arbitrate_acp_turn_before_finish(
+    core: &Core,
+    id: u32,
+    turn_num: u64,
+) -> Option<crate::ai::ClassifyTerminalStateResult> {
+    if !core.ai.status_arbitration_enabled() {
+        return None;
+    }
+    let snapshot = {
+        let st = core.lock();
+        let a = st.reg.agents.get(&id).filter(|a| a.is_live())?;
+        if a.labels.contains_key("drove.worker")
+            || a.pending_permission.is_some()
+            || st.inboxes.get(&id).is_some_and(|q| !q.is_empty())
+        {
+            return None;
+        }
+        let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
+        if crate::status::acp_turn_has_pending_question_tool(entries, turn_num) {
+            return None;
+        }
+        let assistant_text = crate::status::acp_turn_assistant_text(entries, turn_num);
+        if assistant_text.trim().is_empty() {
+            return None;
+        }
+        let last_user_prompt = entries.iter().rev().find_map(|e| match e {
+            Entry::User { turn, text, .. } if *turn == turn_num => Some(crate::transcript::strip_h2_envelope(text)),
+            _ => None,
+        });
+        let is_zh = crate::ai::digest::entries_prefer_zh(entries);
+        let program = a.agent.clone().unwrap_or_else(|| "acp".into());
+        (program, last_user_prompt, assistant_text, is_zh)
+    };
+    let (program, last_user_prompt, assistant_text, is_zh) = snapshot;
+    Some(
+        crate::ai::classify_acp_turn_state(
+            &core.ai,
+            &program,
+            last_user_prompt.as_deref(),
+            &assistant_text,
+            Some(if is_zh { "zh" } else { "en" }),
+        )
+        .await,
+    )
+}
+
+fn finish_turn(
+    core: &Core,
+    id: u32,
+    turn_num: u64,
+    res: Result<Value, CallError>,
+    turn_cancelled: bool,
+    ai_verdict: Option<crate::ai::ClassifyTerminalStateResult>,
+) {
     let mut st = core.lock();
     st.pending_perms.remove(&id);
     if let Some(a) = st.reg.agents.get_mut(&id) {
@@ -1629,26 +1712,23 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
     }
     let mut turn_err = None;
     let mut turn_usage_detail = None;
-    let mut ai_fallback_question = None;
-    let mut arbitrate_with_ai = false;
+    let mut ai_digest: Option<(Option<String>, Option<String>)> = None;
     match res {
         Ok(val) => {
             turn_usage_detail = proto::extract_prompt_result_usage(&val);
-            let _parsed: SessionPromptResult = serde_json::from_value(val).unwrap_or_default();
+            let parsed: SessionPromptResult = serde_json::from_value(val).unwrap_or_default();
+            let cancelled = turn_cancelled || parsed.stop_reason.eq_ignore_ascii_case("cancelled");
             let is_drove_worker = st.reg.agents.get(&id).is_some_and(|a| a.labels.contains_key("drove.worker"));
+            let has_queued_inbox = st.inboxes.get(&id).is_some_and(|q| !q.is_empty());
             let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
-            let pending_q_tool = !is_drove_worker && crate::status::acp_turn_has_pending_question_tool(entries, turn_num);
-            let question_summary = if is_drove_worker {
+            let pending_q_tool =
+                !cancelled && !is_drove_worker && crate::status::acp_turn_has_pending_question_tool(entries, turn_num);
+            let question_summary = if cancelled || is_drove_worker {
                 None
             } else {
                 crate::status::detect_acp_turn_needs_user_input(entries, turn_num)
             };
-            let has_assistant_text = !crate::status::acp_turn_assistant_text(entries, turn_num).trim().is_empty();
-            arbitrate_with_ai = !is_drove_worker
-                && !pending_q_tool
-                && has_assistant_text
-                && core.ai.status_arbitration_enabled();
-            if pending_q_tool {
+            if pending_q_tool && !has_queued_inbox {
                 core.apply_status(
                     &mut st,
                     id,
@@ -1659,9 +1739,47 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
                         ..StatusReport::root("blocked")
                     },
                 );
-            } else if arbitrate_with_ai {
-                ai_fallback_question = question_summary;
+            } else if has_queued_inbox {
                 core.apply_status(&mut st, id, &StatusReport::root("idle"));
+            } else if let Some(verdict) = ai_verdict.filter(|v| v.used_ai) {
+                if verdict.accepted {
+                    if verdict.semantic_title.is_some() || verdict.micro_summary.is_some() {
+                        ai_digest = Some((verdict.semantic_title, verdict.micro_summary));
+                    }
+                    match verdict.state.as_deref() {
+                        Some("blocked") => {
+                            let kind = match verdict.kind.as_deref() {
+                                Some("permission") => Some("permission"),
+                                Some("auth") => Some("auth"),
+                                _ => Some("question"),
+                            };
+                            let msg = verdict.summary.or(question_summary).unwrap_or_default();
+                            core.apply_status(
+                                &mut st,
+                                id,
+                                &StatusReport { state: "blocked", kind, message: msg, ..StatusReport::root("blocked") },
+                            );
+                        }
+                        Some("error") => {
+                            let msg = verdict.summary.unwrap_or_default();
+                            core.apply_status(
+                                &mut st,
+                                id,
+                                &StatusReport { state: "error", message: msg, ..StatusReport::root("error") },
+                            );
+                        }
+                        _ => {
+                            let msg = verdict.summary.unwrap_or_default();
+                            core.apply_status(
+                                &mut st,
+                                id,
+                                &StatusReport { state: "idle", message: msg, ..StatusReport::root("idle") },
+                            );
+                        }
+                    }
+                } else {
+                    core.apply_status(&mut st, id, &StatusReport::root("idle"));
+                }
             } else if let Some(msg) = question_summary {
                 core.apply_status(
                     &mut st,
@@ -1697,7 +1815,6 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
             );
         }
     }
-    let arbitrate_status = turn_err.is_none() && arbitrate_with_ai;
     if let Some(a) = st.reg.agents.get(&id)
         && let Some(wid) = a.labels.get("drove.worker")
     {
@@ -1711,11 +1828,11 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
         });
     }
     core.refresh_agent_digest_deterministic(&mut st, id, true);
+    if let Some((sem_title, micro)) = ai_digest {
+        core.apply_digest(&mut st, id, sem_title, micro, true);
+    }
     drop(st);
     core.spawn_agent_digest_ai(id, Duration::from_secs(3));
-    if arbitrate_status {
-        core.spawn_acp_status_ai(id, turn_num, ai_fallback_question);
-    }
 }
 
 fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
@@ -1806,8 +1923,7 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
         }
         ParsedUpdate::Other => {
             if let Some(detail) = proto::extract_usage_update_detail(params) {
-                let drove_wid =
-                    core.lock().reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")).cloned();
+                let drove_wid = core.lock().reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")).cloned();
                 if let Some(worker_id) = drove_wid {
                     let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::UsageUpdated {
                         worker_id,
@@ -1850,18 +1966,14 @@ fn decide_drove_worker_permission(
                     permissions::pick_deny(&parsed.options, None).map_or(Decision::AutoCancel, Decision::AutoSelect);
                 Some((
                     dec,
-                    Some(format!(
-                        "Blocked by Drove readonly guardrail on `{}` ({:?})",
-                        parsed.title, parsed.kind
-                    )),
+                    Some(format!("Blocked by Drove readonly guardrail on `{}` ({:?})", parsed.title, parsed.kind)),
                 ))
             }
         }
         "scoped_write" => {
-            let is_write_kind = parsed
-                .kind
-                .as_deref()
-                .is_some_and(|k| matches!(k.trim().to_ascii_lowercase().as_str(), "edit" | "write" | "modify" | "delete"));
+            let is_write_kind = parsed.kind.as_deref().is_some_and(|k| {
+                matches!(k.trim().to_ascii_lowercase().as_str(), "edit" | "write" | "modify" | "delete")
+            });
             let target_paths = crate::drove::roles::extract_tool_target_paths(raw_params);
             if is_write_kind || !target_paths.is_empty() {
                 let allowed: Vec<String> = agent
@@ -1902,7 +2014,11 @@ fn handle_permission(core: &Core, transport: &Transport, id: u32, turn_num: u64,
             (permissions::decide(a.permission_mode, parsed.kind.as_deref(), &parsed.options), None, wid)
         }
     } else {
-        (permissions::decide(permissions::PermissionMode::default(), parsed.kind.as_deref(), &parsed.options), None, None)
+        (
+            permissions::decide(permissions::PermissionMode::default(), parsed.kind.as_deref(), &parsed.options),
+            None,
+            None,
+        )
     };
     let ts_ms = crate::runtime::now_ms();
 

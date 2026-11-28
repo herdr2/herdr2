@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.0.26
+
+#### 中文
+
+**状态管理与 AI 仲裁重构**
+- **手动修改智能体状态后，产生新的具体操作自动恢复实时识别**：
+  - Core 与 App 侧协同对齐手动状态水位线与解除条件：查看、切页、滚动、窗口聚焦、未提交草稿及空回车均保持手动锁定；一旦发生提示词提交、审批/拒绝、TUI 交互确认、`Ctrl+C`/中断、收件箱触发或检查点回滚等实际操作，立即解除手动锁定并交回协议 + VT + AI 实时跟踪。
+- **「待确认（`blocked`）」严格门控并补齐全部交互解锁链路**：
+  - 仅在用户实际提交回复、审批/拒绝权限请求、在底部 TUI 交互框按确认键（`Enter`/`Space`/`y`/`n`/数字键/`Esc`/`Ctrl+C`）或中断/回滚时解除 `blocked` 锁定。
+  - 注册并打通 `agent.approve`、`agent.deny`、`agent.interrupt` 命令及 Peek / Briefing / 侧栏等所有交互目标跟踪。
+- **强化 AI 状态仲裁与多组件状态展示**：
+  - 在 ACP 轮次结束落盘前执行 Core AI 纳米级状态仲裁（取消轮次自动跳过），消除 `Working -> Done -> Needs you` 的二次状态闪烁；为 `pty_status` 注入最近一次用户指令 `last_user_prompt` 并生成简明状态原因摘要。
+  - 统一输出 `status_source` / `status_kind` / `status_reason` 元数据，并在侧边栏、简报悬浮提示、窗格顶栏、Peek 顶栏与标签栏直观呈现待确认原因、手动标识及点击状态胶囊切换能力。
+
+---
+
+#### English
+
+**State Management & AI Arbitration Refactor**
+- **Auto-Resume Real-Time Status Tracking After Concrete Operations Following Manual Overrides**:
+  - Core and App coordinate manual override watermarks and release gates so passive inspection, tab switching, scrolling, focus changes, unsubmitted drafts, and empty Enter keep the manual lock, while concrete operations (prompt submission, permission approval/denial, TUI prompt confirmation, interrupt/`Ctrl+C`, inbox dispatch, or checkpoint rollback) cleanly restore live protocol + VT + AI tracking.
+- **Strict `blocked` Gating & Complete Interactive Action Paths**:
+  - `blocked` holds now clear only on actual user actions (reply submission, permission approval/denial, TUI confirmation keys `Enter`/`Space`/`y`/`n`/`1-9`/`Esc`/`Ctrl+C`, interrupt, or rollback).
+  - Registered and wired `agent.approve`, `agent.deny`, and `agent.interrupt` commands along with full `h2_interaction_target` tracking across Peek, Briefing, inbox, review, and rollback flows.
+- **Improved AI Status Arbitration & Unified Multi-Surface Status Presentation**:
+  - Added pre-finish ACP turn AI arbitration (skipped on cancelled turns) to eliminate `Working -> Done -> Needs you` flicker, injected `last_user_prompt` context into `pty_status`, and surfaced concise status reason summaries.
+  - Exposed unified `status_source`, `status_kind`, and `status_reason` metadata across `agents()`, `panes()`, and `terminals()`, with updated status pills, tooltips, manual badges, and direct status switching across sidebar, briefing, pane header, Peek, and tabs.
+
 ## v2.0.25
 
 #### 中文

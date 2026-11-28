@@ -194,8 +194,12 @@ pub struct TerminalView {
     draft: RefCell<CliDraftTracker>,
     /// When the person last pressed Enter/newline in this pane.
     last_enter_at: Cell<Option<Instant>>,
-    /// When the person last submitted a non-empty prompt via Enter in this pane.
+    /// When the person last submitted a non-empty prompt (or confirmed an interactive prompt) in this pane.
     last_submit_at: Cell<Option<Instant>>,
+    /// When the person last performed any concrete execution/decision operation (prompt submit, TUI prompt choice, or Ctrl+C/Esc cancel).
+    last_action_at: Cell<Option<Instant>>,
+    /// Most recent non-empty prompt submitted by the person in this pane (used as context for AI status arbitration).
+    last_submitted_prompt: RefCell<Option<String>>,
     /// When the current PTY stream attached (suppresses attach replay from counting as live output).
     attached_at: Instant,
     /// Last non-echo PTY output timestamp (fallback activity signal for CLI agents without OSC 7501).
@@ -1006,6 +1010,8 @@ impl TerminalView {
             draft: RefCell::new(CliDraftTracker::default()),
             last_enter_at: Cell::new(None),
             last_submit_at: Cell::new(None),
+            last_action_at: Cell::new(None),
+            last_submitted_prompt: RefCell::new(None),
             attached_at: Instant::now(),
             last_output_at: None,
             last_text_fingerprint: None,
@@ -1211,6 +1217,14 @@ impl TerminalView {
 
     pub fn last_submit_at(&self) -> Option<Instant> {
         self.last_submit_at.get()
+    }
+
+    pub fn last_action_at(&self) -> Option<Instant> {
+        self.last_action_at.get()
+    }
+
+    pub fn last_submitted_prompt(&self) -> Option<String> {
+        self.last_submitted_prompt.borrow().clone()
     }
 
     pub fn last_output_at(&self) -> Option<Instant> {
@@ -1505,18 +1519,39 @@ impl TerminalView {
     fn send(&self, bytes: &[u8]) {
         let now = Instant::now();
         self.typed_at.set(Some(now));
+        let pre_draft = self.draft.borrow().text();
         let (submitted, mut submitted_non_empty) = self.draft.borrow_mut().feed(bytes);
+        let mut submitted_prompt =
+            submitted_non_empty.then(|| pre_draft.trim().to_owned()).filter(|s| !s.is_empty());
         if submitted && !submitted_non_empty {
             let (rows, cursor_row) = self.grid.borrow().vt.active_prompt_rows(40);
-            if matches!(inspect_cli_input_box(&rows, cursor_row), CliScreenInput::Text(_)) {
+            if let CliScreenInput::Text(screen_text) = inspect_cli_input_box(&rows, cursor_row) {
                 submitted_non_empty = true;
+                submitted_prompt = Some(screen_text);
             }
+        }
+        if let Some(prompt_text) = submitted_prompt {
+            *self.last_submitted_prompt.borrow_mut() = Some(prompt_text);
         }
         if submitted || bytes.contains(&b'\r') || bytes.contains(&b'\n') {
             self.last_enter_at.set(Some(now));
         }
-        if submitted_non_empty {
+        let mut affirmative_prompt_choice = false;
+        let mut concrete_action = submitted_non_empty || is_ctrl_c_interrupt_bytes(bytes);
+        if !concrete_action
+            && let Some(affirmative) = classify_interactive_prompt_decision_key(bytes)
+        {
+            let tail = self.grid.borrow().vt.tail_lines(20);
+            if classify_quiet_tail_confirmation(&tail) == QuietBlockConfidence::ExplicitPrompt {
+                concrete_action = true;
+                affirmative_prompt_choice = affirmative;
+            }
+        }
+        if submitted_non_empty || affirmative_prompt_choice {
             self.last_submit_at.set(Some(now));
+        }
+        if concrete_action {
+            self.last_action_at.set(Some(now));
         }
         let mut g = self.grid.borrow_mut();
         if let Some(ch) = g.channel
@@ -2645,6 +2680,92 @@ fn pty_is_short_choice_hint(line: &str) -> bool {
             || low.contains("recommended")
             || low.contains("default")
             || low.contains("reply"))
+}
+
+/// Returns true when `bytes` represents a Ctrl+C interrupt (raw `0x03`, CSI-u, modifyOtherKeys, or Win32).
+pub(crate) fn is_ctrl_c_interrupt_bytes(bytes: &[u8]) -> bool {
+    if bytes.contains(&0x03) || bytes == b"\x1b[99;5u" || bytes == b"\x1b[27;5;99~" {
+        return true;
+    }
+    if bytes.starts_with(b"\x1b[") && bytes.ends_with(b"_")
+        && let Ok(body) = std::str::from_utf8(&bytes[2..bytes.len() - 1])
+    {
+        let parts: Vec<u32> = body.split(';').filter_map(|p| p.parse::<u32>().ok()).collect();
+        if parts.len() >= 5 && parts[3] == 1 && parts[0] == 67 && (parts[4] & 0x0c) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classifies a single keystroke sent while an interactive TUI confirmation/picker widget is on screen.
+/// Returns `Some(true)` for affirmative/selection choices (`Enter`, `Space`, `y`/`Y`, `1`..=`9`),
+/// `Some(false)` for explicit rejection/cancel choices (`n`/`N`, `Esc`), and `None` for navigation
+/// (`Up`/`Down`/`Tab`), modifiers (`Shift+Enter`), focus/mouse events, or ordinary multi-char typing.
+pub(crate) fn classify_interactive_prompt_decision_key(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        b"\r" | b"\n" | b"\r\n" | b" " | b"y" | b"Y" | b"1" | b"2" | b"3" | b"4" | b"5" | b"6" | b"7" | b"8"
+        | b"9" => return Some(true),
+        b"n" | b"N" | b"\x1b" => return Some(false),
+        _ => {}
+    }
+    // Kitty CSI-u: CSI code [; modifiers] u
+    if bytes.starts_with(b"\x1b[") && bytes.ends_with(b"u")
+        && let Ok(body) = std::str::from_utf8(&bytes[2..bytes.len() - 1])
+    {
+        let mut parts = body.split(';');
+        let code = parts.next().and_then(|p| p.parse::<u32>().ok())?;
+        let mods = parts.next().and_then(|p| p.split(':').next()?.parse::<u32>().ok()).unwrap_or(1);
+        if mods <= 2 {
+            return match code {
+                13 if mods == 1 => Some(true),
+                32 | 121 | 89 | 49..=57 => Some(true),
+                110 | 78 | 27 => Some(false),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // modifyOtherKeys: CSI 27;mod;code~
+    if bytes.starts_with(b"\x1b[27;") && bytes.ends_with(b"~")
+        && let Ok(body) = std::str::from_utf8(&bytes[5..bytes.len() - 1])
+    {
+        let mut parts = body.split(';');
+        let mods = parts.next().and_then(|p| p.parse::<u32>().ok())?;
+        let code = parts.next().and_then(|p| p.parse::<u32>().ok())?;
+        if mods == 1 {
+            return match code {
+                13 | 32 | 121 | 89 | 49..=57 => Some(true),
+                110 | 78 | 27 => Some(false),
+                _ => None,
+            };
+        }
+        return None;
+    }
+    // Win32 input mode: CSI Vk;Sc;Uc;Kd;Cs;Rc _
+    if bytes.starts_with(b"\x1b[") && bytes.ends_with(b"_")
+        && let Ok(body) = std::str::from_utf8(&bytes[2..bytes.len() - 1])
+    {
+        let parts: Vec<u32> = body.split(';').filter_map(|p| p.parse::<u32>().ok()).collect();
+        if parts.len() >= 5 && parts[3] == 1 {
+            let (vk, uc, cs) = (parts[0], parts[2], parts[4]);
+            let ctrl_or_alt = (cs & (0x01 | 0x02 | 0x04 | 0x08)) != 0;
+            if !ctrl_or_alt {
+                if vk == 13 && (cs & 0x10) == 0 {
+                    return Some(true);
+                }
+                if vk == 27 {
+                    return Some(false);
+                }
+                return match uc {
+                    32 | 121 | 89 | 49..=57 => Some(true),
+                    110 | 78 => Some(false),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
 }
 
 fn pty_line_has_direct_ui_prompt(line: &str) -> bool {
@@ -6997,5 +7118,26 @@ mod tests {
             joined,
             "第一行要求：  请检查登录接口的异常分支并补充单元测试\n第二行[31m约束：保持向后兼容\n第三行：验证通过后输出改动清单"
         );
+    }
+
+    #[test]
+    fn interactive_prompt_decision_keys_distinguish_confirmation_from_navigation_and_noise() {
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\r"), Some(true));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"y"), Some(true));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"1"), Some(true));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[13u"), Some(true));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"n"), Some(false));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b"), Some(false));
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[27u"), Some(false));
+        // Navigation, Shift+Enter, focus, mouse wheel, and multi-char drafts are NOT prompt decisions.
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[A"), None);
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[B"), None);
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[13;2u"), None);
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[I"), None);
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"\x1b[<64;10;10M"), None);
+        assert_eq!(super::classify_interactive_prompt_decision_key(b"draft"), None);
+        assert!(super::is_ctrl_c_interrupt_bytes(b"\x03"));
+        assert!(super::is_ctrl_c_interrupt_bytes(b"\x1b[99;5u"));
+        assert!(!super::is_ctrl_c_interrupt_bytes(b"c"));
     }
 }

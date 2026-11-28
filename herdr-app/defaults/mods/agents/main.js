@@ -433,6 +433,7 @@ export default class Agents extends View {
     const ag = agents().find((x) => x.address === terminal);
     const term = terminals().find((x) => x.address === terminal);
     const manual = ag?.manual_status ?? term?.manual_status ?? null;
+    const liveStatus = ag?.status ?? term?.status ?? "idle";
     const active = manual ?? "auto";
     const items = statusItems();
     const select = (id) => {
@@ -443,6 +444,11 @@ export default class Agents extends View {
       if (it.id === "auto") return svg("mods/workspace-chrome/clock.svg").size(14).flex_none().text_color(t.muted);
       return div().w(14).flex_none().flex().items_center().justify_center().child(this.status(t, { status: it.id }, true));
     };
+    const subtitle = manual
+      ? tr("Resumes auto-detect on next action", "有新操作后自动恢复实时识别")
+      : liveStatus === "blocked"
+        ? tr("Locked until you act or change status", "待确认：需产生具体操作后推进")
+        : tr("Live protocol + VT + AI tracking", "协议 + 终端 + AI 实时识别中");
     return v_flex()
       .id("ag-status-menu")
       .track_focus(this.handle)
@@ -458,10 +464,18 @@ export default class Agents extends View {
         else return;
         cx.notify();
       })
-      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child(tr("Agent status", "智能体状态")))
+      .child(
+        v_flex()
+          .px(8)
+          .pt(4)
+          .pb(6)
+          .gap(2)
+          .child(div().text_size(11).font_medium().text_color(t.muted).child(tr("Agent status", "智能体状态")))
+          .child(div().text_size(10).text_color(t.dim).child(subtitle)),
+      )
       .children(items.map((it, i) => {
         const picked = it.id === active;
-        const hint = it.id === "auto" ? (manual ? "" : tr("Default", "默认")) : picked ? tr("Manual", "手动") : "";
+        const hint = it.id === "auto" ? (manual ? tr("Resume", "恢复自动") : tr("Active", "生效中")) : picked ? tr("Manual", "手动") : "";
         return v_flex()
           .when(it.id === "auto", (el) => el.child(div().mx(7).my(4).h(1).bg(t.border)))
           .child(
@@ -487,35 +501,51 @@ export default class Agents extends View {
 
   statusButton(t, addr, a, compact = false) {
     const label = statusLabels()[a.status] ?? tr("Idle", "空闲");
-    const aiSummary = !a.manual_status && typeof a.ai_status_summary === "string" ? a.ai_status_summary.trim() : "";
-    const aiKind = !a.manual_status && typeof a.ai_status_kind === "string" ? a.ai_status_kind.trim() : "";
-    const aiTag = aiSummary
-      ? ` · ${aiKind === "error" ? tr("Error", "异常") : "AI"}: ${aiSummary}`
+    const isManual = Boolean(a.manual_status);
+    const permTitle = !isManual && typeof a.pending_permission?.title === "string" ? a.pending_permission.title.trim() : "";
+    const reason = !isManual
+      ? (permTitle || String(a.status_reason ?? a.ai_status_summary ?? "").trim())
       : "";
-    const tip = tr(
-      `Status: ${label}${a.manual_status ? " (manual · auto-detect paused)" : ""}${aiTag} — click to change`,
-      `状态：${label}${a.manual_status ? "（手动锁定，已暂停自动检测）" : ""}${aiTag} — 点击更改`,
-    );
-    const active = this.hovered === addr || this.hoveredSub === addr || Boolean(a.manual_status);
+    const kind = !isManual ? String(a.status_kind ?? a.ai_status_kind ?? (permTitle ? "permission" : "")).trim() : "";
+    const source = isManual ? "manual" : String(a.status_source ?? (permTitle ? "permission" : reason ? "ai" : "")).trim();
+    const sourceTag = isManual
+      ? tr(" (manual · resumes on next action)", "（手动设置 · 新操作后自动恢复）")
+      : source === "permission"
+        ? tr(" (awaiting approval)", "（等待权限审批）")
+        : source === "ai"
+          ? tr(" (AI arbitrated)", "（AI 智能研判）")
+          : "";
+    const reasonLine = reason
+      ? `\n▸ ${kind === "error" ? tr("Error: ", "异常：") : kind === "permission" ? tr("Approval: ", "待审批：") : ""}${reason}`
+      : "";
+    const gateLine = !isManual && a.status === "blocked"
+      ? `\n${tr("Requires your reply, confirmation, or approval to advance", "需产生实际回复、确认或审批操作后进入下一状态")}`
+      : "";
+    const tip = `${tr(`Status: ${label}`, `状态：${label}`)}${sourceTag}${reasonLine}${gateLine}\n${tr("Click to change status", "点击切换状态")}`;
+    const active = this.hovered === addr || this.hoveredSub === addr || isManual;
     const btn = h_flex()
       .id(`status-${addr}`)
       .min_w(24)
       .h(22)
       .px(5)
+      .gap(3)
       .rounded(5)
       .items_center()
       .justify_center()
       .flex_none()
-      .when(active, (el) => el.bg(t.raised).border_1().border_color(a.manual_status ? (t.accent ?? t.border) : t.border))
+      .when(active, (el) => el.bg(t.raised).border_1().border_color(isManual ? (t.accent ?? t.border) : t.border))
       .cursor_pointer()
       .hover((s) => s.bg(t.raised).border_1().border_color(t.border))
       .tooltip(tip)
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
-        openOverlay({ mod: "agents", kind: "popup", width: 215, height: 220, props: { statusMenu: true, terminal: addr } });
+        openOverlay({ mod: "agents", kind: "popup", width: 236, height: 244, props: { statusMenu: true, terminal: addr } });
       })
-      .child(this.status(t, a, compact));
+      .child(this.status(t, a, compact))
+      .when(isManual && !compact, (el) =>
+        el.child(div().text_size(9.5).font_semibold().text_color(t.accent ?? t.muted).child(tr("M", "手"))),
+      );
     return btn;
   }
 
@@ -1872,8 +1902,12 @@ export default class Agents extends View {
       .child(this.statusButton(t, k.address, {
         status: st,
         manual_status: k.manual_status,
+        status_source: k.status_source,
+        status_kind: k.status_kind ?? k.ai_status_kind,
+        status_reason: k.status_reason ?? k.ai_status_summary,
         ai_status_summary: k.ai_status_summary,
         ai_status_kind: k.ai_status_kind,
+        pending_permission: k.pending_permission,
       }, compact));
   }
 
@@ -1883,10 +1917,12 @@ export default class Agents extends View {
     if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
     if (a.status === "blocked") {
-      const aiSummary = !a.manual_status && typeof a.ai_status_summary === "string" ? a.ai_status_summary.trim() : "";
-      const isErr = !a.manual_status && a.ai_status_kind === "error";
-      const badgeLabel = aiSummary || (isErr ? tr("Error", "异常") : tr("Needs you", "待确认"));
-      return div().flex_none().max_w(130).truncate().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child(badgeLabel);
+      const permTitle = !a.manual_status && typeof a.pending_permission?.title === "string" ? a.pending_permission.title.trim() : "";
+      const reason = !a.manual_status ? (permTitle || String(a.status_reason ?? a.ai_status_summary ?? "").trim()) : "";
+      const kind = !a.manual_status ? String(a.status_kind ?? a.ai_status_kind ?? (permTitle ? "permission" : "")).trim() : "";
+      const isErr = kind === "error";
+      const badgeLabel = reason || (isErr ? tr("Error", "异常") : kind === "permission" ? tr("Needs approval", "待审批") : tr("Needs you", "待确认"));
+      return div().flex_none().max_w(136).truncate().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child(badgeLabel);
     }
     // Idle: a ring; done: a dot.
     if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
@@ -2440,8 +2476,12 @@ export default class Agents extends View {
           const merged = liveRec
             ? {
                 ...a,
+                status_source: a.status_source ?? liveRec.status_source,
+                status_kind: a.status_kind ?? liveRec.status_kind ?? a.ai_status_kind ?? liveRec.ai_status_kind,
+                status_reason: a.status_reason ?? liveRec.status_reason ?? a.ai_status_summary ?? liveRec.ai_status_summary,
                 ai_status_summary: a.ai_status_summary ?? liveRec.ai_status_summary,
                 ai_status_kind: a.ai_status_kind ?? liveRec.ai_status_kind,
+                pending_permission: liveRec.pending_permission,
               }
             : a;
           if (isFloating) {
