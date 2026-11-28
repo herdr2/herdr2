@@ -1390,10 +1390,10 @@ fn default_question_mode() -> String {
     "draft".into()
 }
 fn default_conflict_policy() -> String {
-    "warn".into()
+    "auto_worktree".into()
 }
 fn default_loop_detect() -> String {
-    "off".into()
+    "steer_once".into()
 }
 
 impl Default for AiSettings {

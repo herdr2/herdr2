@@ -901,7 +901,7 @@
             "type": "string"
           },
           "conflictPolicy": {
-            "default": "warn",
+            "default": "auto_worktree",
             "type": "string"
           },
           "contextWindow": {
@@ -929,7 +929,7 @@
             ]
           },
           "loopDetect": {
-            "default": "off",
+            "default": "steer_once",
             "type": "string"
           },
           "maxTokens": {
@@ -2748,11 +2748,11 @@
             "default": {
               "autoTitle": true,
               "baseUrl": "",
-              "conflictPolicy": "warn",
+              "conflictPolicy": "auto_worktree",
               "effort": "low",
               "enabled": true,
               "handoverCompact": true,
-              "loopDetect": "off",
+              "loopDetect": "steer_once",
               "model": "",
               "questionMode": "draft",
               "runNarrator": true,
@@ -6482,7 +6482,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.27"
+    "version": "2.0.28"
   },
   "methods": [
     {

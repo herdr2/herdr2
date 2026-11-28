@@ -2045,7 +2045,7 @@ export function mockAiStatus(): DaemonAiStatus {
       handoverCompact: true,
       autoTitle: true,
       taskEnrich: true,
-      conflictPolicy: "warn",
+      conflictPolicy: "auto_worktree",
       questionMode: "draft",
       loopDetect: "steer_once",
     },

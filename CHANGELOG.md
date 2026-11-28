@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.0.28
+
+#### 中文
+
+**行为优化与功能增强**
+- **优化「会话（`Sessions`）」面板交互、视觉排版与普通终端支持**：
+  - 放开普通终端（`zsh` / `bash` / `pwsh` / `cmd` 等）的标签栏「会话」面板入口（仅 ACP 标签页隐藏），在普通终端下展示已安装的 CLI Agent 快捷图标栏及带图标下拉选择器，可随时切换查看不同 Agent 在当前目录下的历史会话。
+  - 重构为单行紧凑顶栏与双行会话列表（自动清洗内部信封前缀、当前会话标记与友好时间），支持上下分割线拖拽调节高度并持久化；移除易遮挡右键菜单的浮动提示框，并在对话详情中默认折叠思考过程与工具调用，提供代码块排版与一键复制恢复命令。
+- **调整 Drove 默认 AI 策略并修复串行任务预检边界**：
+  - 将 Drove 设置中的默认策略更新为：写冲突策略 `auto_worktree`（自动隔离工作树）、提问分诊模式 `draft`（生成草稿）、死循环检测 `steer_once`（自动纠偏一次），同步更新 OpenRPC Schema、设置页兜底默认值及 `drove-web` Mock。
+  - 修复在默认开启 `auto_worktree` 下，`maxConcurrency <= 1` 或分次 `drove add` 构成严格串行依赖链时误触发 `worktree_not_ready` 的预检问题。
+
+---
+
+#### English
+
+**Improvements & Enhancements**
+- **Redesigned `Sessions` Panel UI & Added CLI Agent Picker for Regular Terminals**:
+  - Enabled the `Sessions` panel entry on regular terminal tabs (hidden only on ACP tabs), featuring an installed CLI agent quick-switch pill bar and icon dropdown selector to browse workspace history across any CLI agent.
+  - Streamlined the layout into a compact single-row header, clean two-line session list (stripping internal envelope prefixes, eliminating overlapping hover tooltips), resizable split height (`v_resizable`), and readable conversation view with collapsed thought/tool groups, formatted code blocks, and one-click resume command copy.
+- **Updated Default Drove AI Policies & Fixed Serial Task Worktree Preflight**:
+  - Updated Drove AI policy defaults to `conflictPolicy: "auto_worktree"`, `questionMode: "draft"`, and `loopDetect: "steer_once"` across Core config/OpenRPC schema, Settings fallback defaults, and `drove-web` mock state.
+  - Fixed `tasks_need_worktree_preflight` falsely reporting `worktree_not_ready` when `maxConcurrency <= 1` or incremental `drove add` calls form a strictly serial dependency chain.
+
 ## v2.0.27
 
 #### 中文

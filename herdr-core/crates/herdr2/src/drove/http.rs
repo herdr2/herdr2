@@ -919,7 +919,8 @@ async fn preflight_worktree_http(core: &Arc<Core>, body: &Value) -> Result<Value
     let raw_tasks: Vec<Value> = body["tasks"].as_array().cloned().unwrap_or_default();
     let force = body["force"].as_bool() == Some(true);
     let cfg = core.drove.config_snapshot();
-    let needed = force || super::routes::tasks_need_worktree_preflight(&cfg, &[], &raw_tasks);
+    let max_concurrency = body["maxConcurrency"].as_u64().map(|v| v as u32);
+    let needed = force || super::routes::tasks_need_worktree_preflight(&cfg, &[], &raw_tasks, max_concurrency);
     if !needed {
         return Ok(json!({ "ok": true, "checked": false }));
     }

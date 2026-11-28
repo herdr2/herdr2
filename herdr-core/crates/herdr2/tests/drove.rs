@@ -1089,6 +1089,12 @@ fn drove_models_cache_survives_daemon_restart() {
 fn drove_settings_persists_ai_policy_switches_and_codex_fast() {
     let s = drove_session();
     let initial = s.json(&["drove", "settings"]);
+    assert_eq!(initial["config"]["ai"]["conflictPolicy"], "auto_worktree");
+    assert_eq!(initial["config"]["ai"]["questionMode"], "draft");
+    assert_eq!(initial["config"]["ai"]["loopDetect"], "steer_once");
+    assert_eq!(initial["aiStatus"]["switches"]["conflictPolicy"], "auto_worktree");
+    assert_eq!(initial["aiStatus"]["switches"]["questionMode"], "draft");
+    assert_eq!(initial["aiStatus"]["switches"]["loopDetect"], "steer_once");
     let mut roles = initial["config"]["roles"].clone();
     roles["reviewer"]["primary"] = json!({
         "agent": "codex",

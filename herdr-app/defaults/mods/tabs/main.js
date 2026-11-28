@@ -71,19 +71,13 @@ function find(node, id) {
   return null;
 }
 
-function isCliAgentPaneOrTerm(pane, term) {
+function isNonAcpTerminalPane(pane, term) {
+  if (!pane?.terminal) return false;
   if (pane?.acp || term?.acp) return false;
-  return Boolean(
-    pane?.structured
-      || pane?.program?.agent
-      || term?.program?.agent
-      || term?.saved_cli?.kind
-      || pane?.app
-      || term?.report?.app,
-  );
+  return true;
 }
 
-function activeTabHasCliAgent(space) {
+function activeTabSupportsCliSessions(space) {
   if (!space) return false;
   const activeTab = (space.tabs ?? []).find((t) => t?.active);
   if (!activeTab) return false;
@@ -100,10 +94,9 @@ function activeTabHasCliAgent(space) {
   const focusedPane = tabPanes.find((p) => p.focused && p.terminal);
   if (focusedPane) {
     const fTerm = termByAddr.get(focusedPane.terminal) ?? null;
-    if (focusedPane.acp || fTerm?.acp) return false;
-    if (isCliAgentPaneOrTerm(focusedPane, fTerm)) return true;
+    return isNonAcpTerminalPane(focusedPane, fTerm);
   }
-  return tabPanes.some((p) => p.terminal && isCliAgentPaneOrTerm(p, termByAddr.get(p.terminal) ?? null));
+  return tabPanes.some((p) => isNonAcpTerminalPane(p, termByAddr.get(p.terminal) ?? null));
 }
 
 function resolveEnabledPanels(defaultIds) {
@@ -949,7 +942,7 @@ export default class Tabs extends View {
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
     const enabled = resolveEnabledPanels(["files", "changes", "checkpoints", "sessions", "side-chat"]);
-    const hasCliAgent = activeTabHasCliAgent(space);
+    const hasCliAgent = activeTabSupportsCliSessions(space);
     const hasSideChats = focusedMainSideChatCount() > 0;
     const effectiveEnabled = enabled.filter(
       (id) => (id !== "sessions" || hasCliAgent) && (id !== "side-chat" || hasSideChats),

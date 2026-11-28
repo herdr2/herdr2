@@ -838,7 +838,7 @@ pub(super) async fn add_tasks_http(
     if !skip_preflight {
         let cfg = core.drove.config_snapshot();
         let existing_tasks = core.drove.store.list_tasks(&run.id);
-        if tasks_need_worktree_preflight(&cfg, &existing_tasks, &raw_list) {
+        if tasks_need_worktree_preflight(&cfg, &existing_tasks, &raw_list, Some(run.max_concurrency)) {
             let cwd_check = run.cwd.clone();
             let check = tokio::task::spawn_blocking(move || super::integrate::check_drove_worktree_ready(&cwd_check))
                 .await
@@ -923,6 +923,7 @@ pub(super) fn tasks_need_worktree_preflight(
     cfg: &DroveConfig,
     existing_tasks: &[Task],
     raw_incoming: &[Value],
+    max_concurrency: Option<u32>,
 ) -> bool {
     let is_writable_role = |role: Option<&str>| -> bool {
         let (_, _, access, _) = super::config::role_spec_for(cfg, role);
@@ -930,6 +931,7 @@ pub(super) fn tasks_need_worktree_preflight(
     };
 
     let mut incoming_writers = 0usize;
+    let mut incoming_has_foreach_fanout = false;
     for raw in raw_incoming {
         let iso = raw["isolation"].as_str().map(|s| s.trim().to_ascii_lowercase());
         if iso.as_deref() == Some("worktree") {
@@ -941,6 +943,9 @@ pub(super) fn tasks_need_worktree_preflight(
         let role = raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str());
         if is_writable_role(role) {
             let count = raw.get("foreach").and_then(Value::as_array).map_or(1, |a| a.len().max(1));
+            if count >= 2 {
+                incoming_has_foreach_fanout = true;
+            }
             incoming_writers += count;
         }
     }
@@ -949,7 +954,11 @@ pub(super) fn tasks_need_worktree_preflight(
         return false;
     }
 
-    let existing_live_writers = existing_tasks
+    if max_concurrency.is_some_and(|m| m <= 1) {
+        return false;
+    }
+
+    let existing_live_writers: Vec<&Task> = existing_tasks
         .iter()
         .filter(|t| {
             !super::scheduler::is_terminal_status(t.status)
@@ -957,43 +966,57 @@ pub(super) fn tasks_need_worktree_preflight(
                 && t.template != Some(true)
                 && is_writable_role(t.assign.as_ref().and_then(|a| a.role.as_deref()))
         })
-        .count();
+        .collect();
 
-    if existing_live_writers + incoming_writers < 2 {
+    if existing_live_writers.len() + incoming_writers < 2 {
         return false;
     }
 
-    // If incoming tasks form a strict linear chain (every subsequent writable task declares deps)
-    // and there are no existing live writers, they won't overlap in parallel.
-    if existing_live_writers == 0 {
-        let root_writers = raw_incoming
-            .iter()
-            .filter(|raw| {
-                raw["kind"].as_str() != Some("exec")
-                    && is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
-                    && raw["deps"].as_array().is_none_or(|d| d.is_empty())
-            })
-            .map(|raw| raw.get("foreach").and_then(Value::as_array).map_or(1, |a| a.len().max(1)))
-            .sum::<usize>();
-        if root_writers < 2 {
-            // Check if any two incoming writers share the same dep (fan-out).
-            let mut by_dep: BTreeMap<String, usize> = BTreeMap::new();
-            for raw in raw_incoming {
-                if raw["kind"].as_str() == Some("exec")
-                    || !is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
-                {
-                    continue;
-                }
-                if let Some(deps) = raw["deps"].as_array() {
-                    for d in deps.iter().filter_map(Value::as_str) {
-                        *by_dep.entry(d.to_string()).or_default() += 1;
-                    }
-                }
-            }
-            if !by_dep.values().any(|&c| c >= 2) {
-                return false;
+    if incoming_has_foreach_fanout {
+        return true;
+    }
+
+    // If all live + incoming writable tasks form a strict linear chain (at most one root writer
+    // without deps, and no two writable tasks share a dep as fan-out), they won't overlap in parallel.
+    let mut root_writers = 0usize;
+    let mut by_dep: BTreeMap<String, usize> = BTreeMap::new();
+    for t in &existing_live_writers {
+        if t.deps.is_empty() {
+            root_writers += 1;
+        } else {
+            for d in &t.deps {
+                let norm = existing_tasks
+                    .iter()
+                    .find(|c| c.id == *d || c.key == *d)
+                    .map_or_else(|| d.clone(), |c| c.key.clone());
+                *by_dep.entry(norm).or_default() += 1;
             }
         }
+    }
+    for raw in raw_incoming {
+        if raw["kind"].as_str() == Some("exec")
+            || !is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
+        {
+            continue;
+        }
+        let deps: Vec<&str> = raw["deps"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if deps.is_empty() {
+            root_writers += 1;
+        } else {
+            for d in deps {
+                let norm = existing_tasks
+                    .iter()
+                    .find(|c| c.id == d || c.key == d)
+                    .map_or_else(|| d.to_string(), |c| c.key.clone());
+                *by_dep.entry(norm).or_default() += 1;
+            }
+        }
+    }
+    if root_writers < 2 && !by_dep.values().any(|&c| c >= 2) {
+        return false;
     }
     true
 }

@@ -1006,7 +1006,7 @@ test("tab bar renders a reopen button on the left only when the sidebar is hidde
   ]);
 });
 
-test("Sessions panel button renders right after Checkpoints for CLI agents (including exited-to-shell saved_cli) and hides on ACP or plain shell tabs", () => {
+test("Sessions panel button renders right after Checkpoints for CLI agents and plain terminals, and hides on ACP tabs", () => {
   const runCalls: unknown[][] = [];
   const localStore: Record<string, string> = {};
   let panelHidden = true;
@@ -1095,9 +1095,16 @@ test("Sessions panel button renders right after Checkpoints for CLI agents (incl
   expect(bodyActive).toBe("sessions");
   view.render();
 
-  // 2) CLI agent exits to shell (saved_cli still present): [会话] remains visible so user can run copied resume command.
-  currentPanes[0] = { ...currentPanes[0], program: { name: "zsh", key: "zsh", agent: false, shell: true } };
+  // 2) Plain shell/terminal tab ALSO keeps [会话] visible so user can pick a CLI agent and inspect/resume sessions.
+  currentTabs = [
+    { id: "tab-cli", name: "Claude", active: false },
+    { id: "tab-acp", name: "ACP", active: false },
+    { id: "tab-sh", name: "zsh", active: true },
+  ];
+  currentPanes[0].focused = false;
+  currentPanes[2].focused = true;
   expect(findById(view.render(), "panel-sessions")).not.toBeNull();
+  expect(panelHidden).toBe(false);
 
   // 3) Switching to ACP tab hides [会话] button and auto-hides the open Sessions panel.
   runCalls.length = 0;
@@ -1106,13 +1113,13 @@ test("Sessions panel button renders right after Checkpoints for CLI agents (incl
     { id: "tab-acp", name: "ACP", active: true },
     { id: "tab-sh", name: "zsh", active: false },
   ];
-  currentPanes[0].focused = false;
+  currentPanes[2].focused = false;
   currentPanes[1].focused = true;
   const acpRoot = view.render();
   expect(findById(acpRoot, "panel-sessions")).toBeNull();
   expect(panelHidden).toBe(true);
 
-  // 4) Plain shell tab also hides [会话].
+  // 4) Switching back to the plain terminal (or CLI agent) tab restores [会话] and reopens the Sessions panel.
   currentTabs = [
     { id: "tab-cli", name: "Claude", active: false },
     { id: "tab-acp", name: "ACP", active: false },
@@ -1120,16 +1127,6 @@ test("Sessions panel button renders right after Checkpoints for CLI agents (incl
   ];
   currentPanes[1].focused = false;
   currentPanes[2].focused = true;
-  expect(findById(view.render(), "panel-sessions")).toBeNull();
-
-  // 5) Switching back to the CLI agent tab restores [会话] and reopens the Sessions panel.
-  currentTabs = [
-    { id: "tab-cli", name: "Claude", active: true },
-    { id: "tab-acp", name: "ACP", active: false },
-    { id: "tab-sh", name: "zsh", active: false },
-  ];
-  currentPanes[2].focused = false;
-  currentPanes[0].focused = true;
   const backRoot = view.render();
   expect(findById(backRoot, "panel-sessions")).not.toBeNull();
   expect(panelHidden).toBe(false);

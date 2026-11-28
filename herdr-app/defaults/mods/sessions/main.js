@@ -1,17 +1,82 @@
-import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, v_resizable, resizable_panel, InputState, Input, Scrollbar } from "gpui-base";
-import { spaces, panes, focused, terminals, theme, settings, h2, checking, openOverlay } from "herdr";
+import { View, div, svg, image } from "gpui-kit";
+import { v_flex, h_flex, v_resizable, resizable_panel, Popup, InputState, Input, Scrollbar } from "gpui-base";
+import { spaces, panes, focused, terminals, knownAgents, shared, setShared, theme, settings, h2, checking, openOverlay, notify } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
-const zoomScale = () => Math.max(0.25, Number(typeof settings === "function" ? settings()?.zoom : 1) || 1);
 
+const KNOWN_AGENTS_KEY = "new-menu.agents";
 const INITIAL_VISIBLE_ITEMS = 60;
 const VISIBLE_ITEMS_STEP = 60;
 const MAX_ENTRY_CHARS = 12000;
-const DEFAULT_SPLIT_TOP_HEIGHT = 208;
-const MIN_SPLIT_TOP_HEIGHT = 84;
+const DEFAULT_SPLIT_TOP_HEIGHT = 220;
+const MIN_SPLIT_TOP_HEIGHT = 96;
 const MAX_SPLIT_TOP_HEIGHT = 680;
+
+const SHELL_NAMES = new Set([
+  "sh", "bash", "zsh", "fish", "nu", "nushell", "dash", "ksh", "csh", "tcsh",
+  "pwsh", "powershell", "cmd", "elvish", "xonsh", "ion",
+]);
+
+// Canonical CLI agents that persist local session history, with fallback display metadata & icons.
+const BUILTIN_CLI_AGENTS = [
+  { key: "claude", name: "Claude Code", icon: "icons/claude.svg", tint: false },
+  { key: "codex", name: "Codex", icon: "icons/codex.svg", tint: false },
+  { key: "agy", name: "Antigravity", icon: "icons/antigravity.svg", tint: false },
+  { key: "cursor", name: "Cursor", icon: "icons/cursor.svg", tint: true },
+  { key: "zcode", name: "ZCode", icon: "icons/zcode.svg", tint: true },
+  { key: "opencode", name: "OpenCode", icon: "icons/opencode.svg", tint: true },
+  { key: "qwen", name: "Qwen Code", icon: "icons/agent.svg", tint: true },
+  { key: "gemini", name: "Gemini CLI", icon: "icons/agent.svg", tint: true },
+  { key: "hermes", name: "Hermes", icon: "icons/hermes.svg", tint: true },
+  { key: "kimi", name: "Kimi", icon: "icons/kimi.svg", tint: false },
+  { key: "pi", name: "Pi", icon: "icons/pi.svg", tint: true },
+  { key: "omp", name: "oh-my-pi", icon: "icons/omp.svg", tint: true },
+  { key: "copilot", name: "Copilot", icon: "icons/copilot.svg", tint: true },
+  { key: "qoder", name: "Qoder", icon: "icons/qoder.svg", tint: true },
+];
+
+const SUPPORTED_AGENT_SET = new Set(BUILTIN_CLI_AGENTS.map((a) => a.key));
+
+function normalizeAgentKey(raw) {
+  const s = String(raw ?? "").trim().toLowerCase().replace(/\.exe$/i, "").replace(/\.real$/i, "");
+  if (!s) return null;
+  if (s === "claude" || s === "claude-code" || s === "claude code") return "claude";
+  if (s === "codex" || s === "codex-cli") return "codex";
+  if (s === "agy" || s === "antigravity" || s === "antigravity-cli") return "agy";
+  if (s === "cursor" || s === "cursor-agent") return "cursor";
+  if (s === "zcode" || s === "zcode-cli") return "zcode";
+  if (s === "opencode") return "opencode";
+  if (s === "qwen" || s === "qwen-code") return "qwen";
+  if (s === "gemini" || s === "gemini-cli") return "gemini";
+  if (s === "hermes" || s === "hermes-agent") return "hermes";
+  if (s === "kimi" || s === "kimi-code" || s === "kimicodecli") return "kimi";
+  if (s === "pi") return "pi";
+  if (s === "omp" || s === "oh-my-pi") return "omp";
+  if (s === "copilot" || s === "github-copilot") return "copilot";
+  if (s === "qoder" || s === "qodercli") return "qoder";
+  if (s === "amp") return "amp";
+  if (s === "kiro" || s === "kiro-cli") return "kiro";
+  if (s === "crush") return "crush";
+  return null;
+}
+
+function getAgentVisual(agentKey, catalog) {
+  const norm = normalizeAgentKey(agentKey) || String(agentKey ?? "").trim().toLowerCase();
+  const fromCatalog = Array.isArray(catalog) ? catalog.find((c) => c.key === norm) : null;
+  if (fromCatalog) return fromCatalog;
+  const builtin = BUILTIN_CLI_AGENTS.find((c) => c.key === norm);
+  if (builtin) return builtin;
+  return { key: norm || "claude", name: norm || "CLI Agent", icon: "icons/agent.svg", tint: true };
+}
+
+function renderAgentIcon(info, size, t) {
+  const iconPath = info?.icon || "icons/agent.svg";
+  if (info?.tint) {
+    return svg(iconPath).size(size).flex_none().text_color(t.foreground);
+  }
+  return image(iconPath).size(size).flex_none();
+}
 
 function readSavedTopHeight() {
   try {
@@ -25,47 +90,62 @@ function readSavedTopHeight() {
   return DEFAULT_SPLIT_TOP_HEIGHT;
 }
 
-function isGenericProgramKey(key) {
-  const k = String(key ?? "").trim().toLowerCase();
-  return !k || k === "agent" || k === "program" || k === "shell" || k === "terminal";
+function readPreferredAgent() {
+  try {
+    if (typeof localStorage !== "undefined" && localStorage?.getItem) {
+      const raw = normalizeAgentKey(localStorage.getItem("sessions.preferredAgent"));
+      if (raw) return raw;
+    }
+  } catch {}
+  return null;
 }
 
-function pickCliAgentKey(pane, term) {
+function writePreferredAgent(agentKey) {
+  const norm = normalizeAgentKey(agentKey);
+  if (!norm) return;
+  try {
+    if (typeof localStorage !== "undefined" && localStorage?.setItem) {
+      localStorage.setItem("sessions.preferredAgent", norm);
+    }
+  } catch {}
+}
+
+function isGenericProgramKey(key) {
+  const k = String(key ?? "").trim().toLowerCase();
+  return !k || k === "agent" || k === "program" || k === "shell" || k === "terminal" || SHELL_NAMES.has(k);
+}
+
+function detectCliAgentOnPane(pane, term) {
   if (pane?.program?.agent && !pane?.program?.shell && !isGenericProgramKey(pane.program.key)) {
-    return String(pane.program.key).trim();
+    const norm = normalizeAgentKey(pane.program.key);
+    if (norm) return norm;
   }
   if (term?.saved_cli?.kind && !isGenericProgramKey(term.saved_cli.kind)) {
-    return String(term.saved_cli.kind).trim();
+    const norm = normalizeAgentKey(term.saved_cli.kind);
+    if (norm) return norm;
   }
   for (const raw of [pane?.app, term?.report?.app]) {
-    if (raw && !isGenericProgramKey(raw)) return String(raw).trim();
+    if (raw && !isGenericProgramKey(raw)) {
+      const norm = normalizeAgentKey(raw);
+      if (norm) return norm;
+    }
   }
   if (term?.program?.agent && !term?.program?.shell && !isGenericProgramKey(term.program.key)) {
-    return String(term.program.key).trim();
+    const norm = normalizeAgentKey(term.program.key);
+    if (norm) return norm;
   }
   if (Array.isArray(term?.argv) && term.argv.length > 0) {
     const first = String(term.argv[0] ?? "").trim();
     const base = (first.split(/[\\/]/).pop() ?? first).replace(/\.exe$/i, "").toLowerCase();
-    if (base && !["sh", "bash", "zsh", "fish", "pwsh", "powershell", "cmd", "nu", "dash"].includes(base)) {
-      return base;
+    if (base && !SHELL_NAMES.has(base)) {
+      const norm = normalizeAgentKey(base);
+      if (norm) return norm;
     }
   }
   return null;
 }
 
-function isCliCandidate(pane, term) {
-  if (pane?.acp || term?.acp) return false;
-  return Boolean(
-    pane?.structured
-      || pane?.program?.agent
-      || term?.program?.agent
-      || term?.saved_cli?.kind
-      || pane?.app
-      || term?.report?.app,
-  );
-}
-
-function resolveActiveCliContext() {
+function resolveActiveTerminalContext() {
   const sList = typeof spaces === "function" ? spaces() : [];
   const pList = typeof panes === "function" ? panes() : [];
   const tList = typeof terminals === "function" ? terminals() : [];
@@ -89,14 +169,23 @@ function resolveActiveCliContext() {
   if (focusedPane) {
     const fTerm = termByAddr.get(focusedPane.terminal) ?? null;
     if (focusedPane.acp || fTerm?.acp) {
-      return { target: null, agent: null, cwd: activeSpace?.folder ?? "", machine: activeSpace?.machine ?? null, activeSessionId: null, turn: 0 };
+      return {
+        supported: false,
+        target: null,
+        detectedAgent: null,
+        isPlainTerminal: false,
+        cwd: activeSpace?.folder ?? "",
+        machine: activeSpace?.machine ?? null,
+        activeSessionId: null,
+        turn: 0,
+      };
     }
-    if (isCliCandidate(focusedPane, fTerm)) {
-      chosenPane = focusedPane;
-    }
-  }
-  if (!chosenPane) {
-    chosenPane = tabPanes.find((p) => isCliCandidate(p, termByAddr.get(p.terminal) ?? null)) ?? null;
+    chosenPane = focusedPane;
+  } else {
+    chosenPane = tabPanes.find((p) => {
+      const tRec = termByAddr.get(p.terminal) ?? null;
+      return !(p.acp || tRec?.acp);
+    }) ?? null;
   }
 
   let target = chosenPane?.terminal ?? null;
@@ -107,7 +196,7 @@ function resolveActiveCliContext() {
     if (fallbackAddr) {
       const fbTerm = termByAddr.get(fallbackAddr) ?? null;
       const fbPane = Array.isArray(pList) ? pList.find((p) => p?.terminal === fallbackAddr) ?? null : null;
-      if (isCliCandidate(fbPane, fbTerm)) {
+      if (!(fbPane?.acp || fbTerm?.acp)) {
         target = fallbackAddr;
         term = fbTerm;
         chosenPane = fbPane;
@@ -115,32 +204,37 @@ function resolveActiveCliContext() {
     }
   }
 
+  const spaceFolder = String(activeSpace?.folder ?? "").trim();
   if (!target) {
     return {
+      supported: Boolean(spaceFolder),
       target: null,
-      agent: null,
-      cwd: activeSpace?.folder ?? "",
+      detectedAgent: null,
+      isPlainTerminal: true,
+      cwd: spaceFolder,
       machine: activeSpace?.machine ?? null,
       activeSessionId: null,
       turn: 0,
     };
   }
 
-  const agent = pickCliAgentKey(chosenPane, term);
+  const detectedAgent = detectCliAgentOnPane(chosenPane, term);
   const cwd = String(
     chosenPane?.cwd
       || term?.foreground?.cwd
       || term?.cwd
       || foc?.cwd
-      || activeSpace?.folder
+      || spaceFolder
       || "",
   ).trim();
   const slash = target.indexOf("/");
   const machine = slash > 0 ? target.slice(0, slash) : (activeSpace?.machine ?? null);
 
   return {
+    supported: true,
     target,
-    agent,
+    detectedAgent,
+    isPlainTerminal: !detectedAgent,
     cwd,
     machine,
     activeSessionId: term?.saved_cli?.session_id ?? null,
@@ -155,15 +249,22 @@ function folderBasename(rawPath) {
   return parts[parts.length - 1] ?? s;
 }
 
-function formatRelativeTime(tsMs) {
+function formatFriendlyTime(tsMs) {
   const ts = Number(tsMs) || 0;
   if (ts <= 0) return "";
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 45) return tr("now", "刚刚");
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+  if (diffSec < 60) return tr("Just now", "刚刚");
+  if (diffSec < 3600) {
+    const m = Math.floor(diffSec / 60);
+    return tr(`${m}m ago`, `${m} 分钟前`);
+  }
+  if (diffSec < 86400) {
+    const h = Math.floor(diffSec / 3600);
+    return tr(`${h}h ago`, `${h} 小时前`);
+  }
   const days = Math.floor(diffSec / 86400);
-  if (days < 7) return `${days}d`;
+  if (days === 1) return tr("Yesterday", "昨天");
+  if (days < 7) return tr(`${days}d ago`, `${days} 天前`);
   const d = new Date(ts);
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
@@ -177,6 +278,47 @@ function formatEntryClock(tsMs) {
   const hh = String(d.getHours()).padStart(2, "0");
   const mi = String(d.getMinutes()).padStart(2, "0");
   return `${hh}:${mi}`;
+}
+
+/**
+ * Strips internal handoff/envelope wrappers from session titles so rows read cleanly.
+ */
+function formatCleanSessionTitle(raw, maxChars = 110) {
+  let s = String(raw ?? "")
+    .replace(/<\/?h2\b[^>]*>/gi, " ")
+    .replace(/<herdr2-handoff\b[^>]*>[\s\S]*?<\/herdr2-handoff>/gi, " ")
+    .replace(/<\/?herdr2-handoff\b[^>]*>/gi, " ")
+    .replace(/<\/?pasted_content\b[^>]*>/gi, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  // Condense verbose handoff preamble if a clear user goal follows it.
+  const goalMatch = s.match(/承接上一轮目标继续推进[：:]\s*(.+)$/);
+  if (goalMatch && goalMatch[1]?.trim()) {
+    s = `${tr("[Handoff] ", "[接力] ")}${goalMatch[1].trim()}`;
+  } else if (/^\[来自\s+[^\]]+的旁路讨论\]/.test(s)) {
+    const rest = s
+      .replace(/^\[来自\s+[^\]]+的旁路讨论\]\s*/, "")
+      .replace(/^请先阅读并消化上述携带的交接上下文[。.]?[^。.]*[。.]?\s*/, "")
+      .replace(/（当前为只读旁路讨论[^）]*）\s*/g, "")
+      .trim();
+    s = rest ? `${tr("[Side chat] ", "[旁路] ")}${rest}` : tr("Side chat discussion", "旁路讨论会话");
+  }
+
+  return s.length > maxChars ? `${s.slice(0, maxChars)}…` : s;
+}
+
+function cleanUserPromptText(raw) {
+  let s = String(raw ?? "").replace(/\r\n/g, "\n");
+  s = s
+    .replace(/^<h2\b[^>]*>\s*/i, "")
+    .replace(/\s*<\/h2>$/i, "")
+    .replace(/^<herdr2-handoff\b[^>]*>[\s\S]*?<\/herdr2-handoff>\s*/i, "")
+    .replace(/<\/?pasted_content\b[^>]*>/gi, "")
+    .trim();
+  if (s.length > MAX_ENTRY_CHARS) return `${s.slice(0, MAX_ENTRY_CHARS)}\n…`;
+  return s;
 }
 
 function cleanSingleLine(raw, maxChars = 140) {
@@ -195,10 +337,61 @@ function clipBodyText(raw) {
   return `${s.slice(0, MAX_ENTRY_CHARS)}\n…`;
 }
 
-function shortSessionId(sid) {
-  const s = String(sid ?? "").trim();
-  if (s.length <= 14) return s;
-  return `${s.slice(0, 8)}…${s.slice(-4)}`;
+/**
+ * Splits markdown assistant text into prose paragraphs/headings/lists and fenced code cards
+ * so responses look clean and readable without raw triple-backtick noise.
+ */
+function parseAssistantBlocks(raw) {
+  const text = clipBodyText(raw);
+  if (!text) return [];
+  const lines = text.split("\n");
+  const blocks = [];
+  let inFence = false;
+  let fenceLang = "";
+  let buf = [];
+
+  const flushProse = () => {
+    if (!buf.length) return;
+    const joined = buf.join("\n").trim();
+    if (joined) {
+      for (const para of joined.split(/\n{2,}/)) {
+        const p = para.trim();
+        if (p) blocks.push({ kind: "prose", text: p });
+      }
+    }
+    buf = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trimStart();
+    const fenceMatch = trimmed.match(/^```([\w.+-]*)\s*$/);
+    if (fenceMatch) {
+      if (!inFence) {
+        flushProse();
+        inFence = true;
+        fenceLang = fenceMatch[1] || "";
+      } else {
+        blocks.push({ kind: "code", lang: fenceLang, text: buf.join("\n") });
+        buf = [];
+        inFence = false;
+        fenceLang = "";
+      }
+      continue;
+    }
+    buf.push(line);
+  }
+  if (inFence) {
+    blocks.push({ kind: "code", lang: fenceLang, text: buf.join("\n") });
+  } else {
+    flushProse();
+  }
+  return blocks;
+}
+
+function cleanInlineMarkdown(line) {
+  return String(line ?? "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
 }
 
 /**
@@ -280,8 +473,10 @@ export function groupTranscriptItems(rawEntries) {
     }
 
     if (kind === "user") {
+      const body = cleanUserPromptText(entry.text);
+      if (!body) continue;
       flushGroup();
-      items.push({ kind: "user", idx: i, entry });
+      items.push({ kind: "user", idx: i, entry, body });
       continue;
     }
 
@@ -308,11 +503,7 @@ export function groupTranscriptItems(rawEntries) {
 function formatActivityGroupSummary(group) {
   const parts = [];
   if (group.thoughtCount > 0) {
-    parts.push(
-      group.thoughtCount > 1
-        ? tr(`Thinking (${group.thoughtCount})`, `思考过程 (${group.thoughtCount})`)
-        : tr("Thinking", "思考过程"),
-    );
+    parts.push(tr("Thought", "思考过程"));
   }
   if (group.toolCount > 0) {
     parts.push(
@@ -323,14 +514,43 @@ function formatActivityGroupSummary(group) {
     );
   }
   if (group.planCount > 0) {
-    parts.push(
-      tr(
-        `${group.planCount} plan${group.planCount === 1 ? "" : "s"}`,
-        `${group.planCount} 项计划`,
-      ),
-    );
+    parts.push(tr("Plan", "执行计划"));
   }
-  return parts.length > 0 ? parts.join(" · ") : tr("Steps", "执行过程");
+  return parts.length > 0 ? parts.join(" · ") : tr("Steps", "中间步骤");
+}
+
+function buildAgentCatalog(rawKnown) {
+  const seen = new Set();
+  const installedList = [];
+  const fallbackList = [];
+
+  if (Array.isArray(rawKnown)) {
+    for (const item of rawKnown) {
+      const norm = normalizeAgentKey(item?.key);
+      if (!norm || seen.has(norm) || !SUPPORTED_AGENT_SET.has(norm)) continue;
+      seen.add(norm);
+      const builtin = BUILTIN_CLI_AGENTS.find((b) => b.key === norm);
+      const entry = {
+        key: norm,
+        name: item?.name || builtin?.name || norm,
+        icon: item?.icon || builtin?.icon || "icons/agent.svg",
+        tint: typeof item?.tint === "boolean" ? item.tint : Boolean(builtin?.tint),
+        installed: Boolean(item?.installed),
+      };
+      if (entry.installed) installedList.push(entry);
+      else fallbackList.push(entry);
+    }
+  }
+
+  for (const b of BUILTIN_CLI_AGENTS) {
+    if (seen.has(b.key)) continue;
+    seen.add(b.key);
+    fallbackList.push({ ...b, installed: false });
+  }
+
+  return installedList.length > 0
+    ? [...installedList, ...fallbackList.filter((x) => x.key === "qwen" || x.key === "gemini")]
+    : BUILTIN_CLI_AGENTS.slice(0, 8).map((b) => ({ ...b, installed: true }));
 }
 
 export default class Sessions extends View {
@@ -344,11 +564,19 @@ export default class Sessions extends View {
     this.expandedGroups = new Set();
     this.expandAllSteps = false;
     this.splitTopHeight = readSavedTopHeight();
-    this.listPaneHeight = DEFAULT_SPLIT_TOP_HEIGHT;
-    this.hoveredSession = null;
-    this.hoverAtBottom = true;
-    this.hasPointerY = false;
-    this.hoverSuppressedUntil = 0;
+    this.hoveredRowId = null;
+    this.copiedSessionId = null;
+    this.copiedUntil = 0;
+
+    // Agent selection state:
+    // - On a plain terminal, uses `preferredAgent` (persisted) or first installed CLI agent.
+    // - On a CLI agent tab, follows `detectedAgent` unless user explicitly picked an override for that target.
+    this.preferredAgent = readPreferredAgent();
+    this.manualOverrideByTarget = new Map();
+    this.lastDetectedByTarget = new Map();
+    this.agentPopupOpen = false;
+    this.knownByMachine = new Map();
+    this.probingMachines = new Set();
 
     this.agent = null;
     this.agentName = null;
@@ -363,45 +591,149 @@ export default class Sessions extends View {
     this.handle = cx.focus_handle();
 
     this.searchInput = InputState.new({
-      placeholder: tr("Filter sessions…", "搜索历史会话…"),
+      placeholder: tr("Search…", "搜索会话…"),
     });
     this.searchFocused = false;
     this.searchInput.on("focus", (_e, cx) => {
       this.searchFocused = true;
-      this.hoveredSession = null;
       cx.notify();
     });
-    this.searchInput.on("blur", (_e, cx) => { this.searchFocused = false; cx.notify(); });
+    this.searchInput.on("blur", (_e, cx) => {
+      this.searchFocused = false;
+      cx.notify();
+    });
     this.searchInput.on("change", (_e, cx) => {
-      this.hoveredSession = null;
       cx.notify();
     });
 
     if (typeof checking !== "function" || !checking()) {
+      const initCtx = resolveActiveTerminalContext();
+      this.ensureKnownAgents(initCtx.machine, cx);
       this.refresh(cx, false);
       cx.timer.every(15000, (cx) => this.refresh(cx, true));
     }
   }
 
-  computeContextKey(ctx) {
-    return `sessions:${ctx.target ?? ""}:${ctx.agent ?? ""}:${ctx.cwd ?? ""}:${ctx.activeSessionId ?? ""}:${ctx.turn ?? 0}`;
+  ensureKnownAgents(machine, cx) {
+    if (typeof knownAgents !== "function") return;
+    if (typeof checking === "function" && checking()) return;
+    const mKey = machine ?? "";
+    if (!this.knownByMachine.has(mKey)) {
+      const cached = typeof shared === "function" ? shared(KNOWN_AGENTS_KEY)?.[mKey] : null;
+      if (Array.isArray(cached) && cached.length > 0) {
+        this.knownByMachine.set(mKey, cached);
+      }
+    }
+    if (this.probingMachines.has(mKey)) return;
+    this.probingMachines.add(mKey);
+    cx?.spawn?.(async (acx) => {
+      try {
+        const list = await knownAgents({ on: machine ?? null });
+        if (Array.isArray(list)) {
+          this.knownByMachine.set(mKey, list);
+          try {
+            if (typeof setShared === "function" && typeof shared === "function") {
+              const prev = shared(KNOWN_AGENTS_KEY);
+              setShared(KNOWN_AGENTS_KEY, { ...(prev && typeof prev === "object" ? prev : {}), [mKey]: list });
+            }
+          } catch {}
+          acx.notify();
+        }
+      } catch {} finally {
+        this.probingMachines.delete(mKey);
+      }
+    });
   }
 
-  dismissHover(cx, suppressMs = 0) {
-    const hadHover = this.hoveredSession !== null;
-    this.hoveredSession = null;
-    if (suppressMs > 0) {
-      this.hoverSuppressedUntil = Date.now() + suppressMs;
+  agentCatalogFor(machine) {
+    const mKey = machine ?? "";
+    const raw = this.knownByMachine.get(mKey)
+      ?? (typeof shared === "function" ? shared(KNOWN_AGENTS_KEY)?.[mKey] : null)
+      ?? null;
+    return buildAgentCatalog(raw);
+  }
+
+  resolveEffectiveAgent(ctx) {
+    const catalog = this.agentCatalogFor(ctx.machine);
+    const targetKey = ctx.target || `space:${ctx.cwd || ""}`;
+
+    // If a terminal transitioned into a different live CLI agent, follow the new live agent automatically.
+    const prevDet = this.lastDetectedByTarget.get(targetKey) ?? null;
+    if (ctx.detectedAgent && ctx.detectedAgent !== prevDet) {
+      this.lastDetectedByTarget.set(targetKey, ctx.detectedAgent);
+      this.manualOverrideByTarget.delete(targetKey);
+    } else if (!ctx.detectedAgent && prevDet) {
+      this.lastDetectedByTarget.delete(targetKey);
     }
-    if (hadHover) cx?.notify?.();
+
+    const manual = this.manualOverrideByTarget.get(targetKey) ?? null;
+    if (manual) return manual;
+
+    if (ctx.detectedAgent) return ctx.detectedAgent;
+
+    if (this.preferredAgent && catalog.some((a) => a.key === this.preferredAgent)) {
+      return this.preferredAgent;
+    }
+    const firstInstalled = catalog.find((a) => a.installed)?.key ?? catalog[0]?.key ?? "claude";
+    return firstInstalled;
+  }
+
+  chooseAgent(agentKey, ctx, cx) {
+    const norm = normalizeAgentKey(agentKey);
+    const targetKey = ctx.target || `space:${ctx.cwd || ""}`;
+    this.agentPopupOpen = false;
+
+    if (!norm) {
+      this.manualOverrideByTarget.delete(targetKey);
+    } else {
+      if (ctx.detectedAgent) {
+        if (norm === ctx.detectedAgent) {
+          this.manualOverrideByTarget.delete(targetKey);
+        } else {
+          this.manualOverrideByTarget.set(targetKey, norm);
+        }
+      } else {
+        this.manualOverrideByTarget.set(targetKey, norm);
+      }
+      this.preferredAgent = norm;
+      writePreferredAgent(norm);
+    }
+
+    this.selectedId = null;
+    this.selectedSession = null;
+    this.loadedSessionKey = null;
+    this.entries = [];
+    this.expandedGroups = new Set();
+    this.expandAllSteps = false;
+    this.refresh(cx, false);
+    cx?.notify?.();
+  }
+
+  computeContextKey(ctx, effectiveAgent) {
+    return `sessions:${ctx.supported ? 1 : 0}:${ctx.target ?? ""}:${effectiveAgent ?? ""}:${ctx.cwd ?? ""}:${ctx.activeSessionId ?? ""}:${ctx.turn ?? 0}`;
+  }
+
+  copyResumeCommand(session, cx) {
+    const cmd = String(session?.resume_command ?? "").trim();
+    if (!cmd) return;
+    try { cx?.write_to_clipboard?.(cmd); } catch {}
+    this.copiedSessionId = session.session_id;
+    this.copiedUntil = Date.now() + 1800;
+    if (typeof notify === "function") {
+      notify({
+        title: tr("Copied resume command (full access)", "已复制恢复对话命令（Full Access）"),
+        body: cmd,
+        level: "info",
+      });
+    }
+    cx?.notify?.();
   }
 
   openSessionMenu(session, cx) {
     if (!session) return;
     cx?.stop_propagation?.();
-    // Dismiss any hover card immediately before opening the popup menu so the two never overlap.
-    this.hoveredSession = null;
-    this.hoverSuppressedUntil = Date.now() + 900;
+    this.hoveredRowId = null;
+    this.agentPopupOpen = false;
     this.selectSession(session, cx);
     openOverlay({
       mod: "menu",
@@ -433,14 +765,13 @@ export default class Sessions extends View {
     }
     const loadKey = `${session.agent || this.agent || ""}:${session.session_id}:${session.updated_ms || 0}`;
     if (changed || this.loadedSessionKey !== loadKey) {
-      this.loadSessionTranscript(session, resolveActiveCliContext(), cx);
+      this.loadSessionTranscript(session, resolveActiveTerminalContext(), cx);
     }
     cx?.notify?.();
   }
 
   toggleActivityGroup(groupId, cx) {
     if (this.expandAllSteps) {
-      // Switching out of expand-all keeps all other groups expanded except the clicked one.
       const all = groupTranscriptItems(this.entries)
         .filter((it) => it.kind === "activity_group")
         .map((it) => it.id);
@@ -464,18 +795,18 @@ export default class Sessions extends View {
     cx?.notify?.();
   }
 
-  buildListArgs(ctx) {
+  buildListArgs(ctx, effectiveAgent) {
     const args = ["session", "ls", "--json"];
     if (ctx.target) args.push(ctx.target);
     if (ctx.cwd) args.push("--cwd", ctx.cwd);
-    if (ctx.agent) args.push("--agent", ctx.agent);
+    if (effectiveAgent) args.push("--agent", effectiveAgent);
     if (!ctx.target && ctx.machine) args.push("--on", ctx.machine);
     return args;
   }
 
   buildReadArgs(session, ctx) {
     const args = ["session", "read", "--json", String(session.session_id)];
-    const ag = session.agent || this.agent || ctx.agent;
+    const ag = session.agent || this.agent || this.resolveEffectiveAgent(ctx);
     if (ag) args.push("--agent", String(ag));
     if (ctx.target) args.push("--target", ctx.target);
     const cwd = this.cwd || ctx.cwd;
@@ -485,13 +816,15 @@ export default class Sessions extends View {
   }
 
   refresh(cx, background = false) {
-    const ctx = resolveActiveCliContext();
-    const nextKey = this.computeContextKey(ctx);
+    const ctx = resolveActiveTerminalContext();
+    this.ensureKnownAgents(ctx.machine, cx);
+    const effectiveAgent = ctx.supported ? this.resolveEffectiveAgent(ctx) : null;
+    const nextKey = this.computeContextKey(ctx, effectiveAgent);
     const keyChanged = nextKey !== this.context;
     if (background && !keyChanged && this.loadingList) return;
     this.context = nextKey;
 
-    if (!ctx.target && !ctx.agent) {
+    if (!ctx.supported || (!ctx.target && !ctx.cwd)) {
       this.reqSeq += 1;
       this.readSeq += 1;
       this.loadingList = false;
@@ -499,7 +832,6 @@ export default class Sessions extends View {
       this.sessions = [];
       this.selectedId = null;
       this.selectedSession = null;
-      this.hoveredSession = null;
       this.loadedSessionKey = null;
       this.entries = [];
       this.expandedGroups = new Set();
@@ -507,19 +839,18 @@ export default class Sessions extends View {
       this.agent = null;
       this.agentName = null;
       this.cwd = ctx.cwd || null;
-      this.error = tr("Switch to a CLI agent tab to inspect its historical sessions", "切换到 CLI Agent 标签页以查看当前工作区历史会话");
+      this.error = tr("Open a terminal or CLI agent tab to view workspace session history", "打开终端或 CLI Agent 标签页以查看当前工作区历史会话");
       cx?.notify?.();
       return;
     }
 
     if (keyChanged && !background) {
       this.error = null;
-      this.hoveredSession = null;
     }
 
     const seq = ++this.reqSeq;
     this.loadingList = true;
-    const args = this.buildListArgs(ctx);
+    const args = this.buildListArgs(ctx, effectiveAgent);
     cx.spawn(async (acx) => {
       try {
         const res = await h2(args);
@@ -535,8 +866,8 @@ export default class Sessions extends View {
         const parsed = JSON.parse(res.stdout || "{}");
         const list = Array.isArray(parsed.sessions) ? parsed.sessions : [];
         const prevAgent = this.agent;
-        this.agent = parsed.agent || ctx.agent || null;
-        this.agentName = parsed.agent_name || parsed.agent || ctx.agent || "CLI";
+        this.agent = normalizeAgentKey(parsed.agent) || effectiveAgent || null;
+        this.agentName = parsed.agent_name || getAgentVisual(this.agent, this.agentCatalogFor(ctx.machine)).name;
         this.cwd = parsed.cwd || ctx.cwd || null;
         this.sessions = list;
         this.error = null;
@@ -637,26 +968,86 @@ export default class Sessions extends View {
     });
   }
 
+  renderAssistantFormatted(body, t) {
+    const blocks = parseAssistantBlocks(body);
+    const mono = settings()?.font_family ?? "JetBrains Mono";
+    return v_flex()
+      .w_full()
+      .min_w(0)
+      .gap(6)
+      .children(
+        blocks.map((b) => {
+          if (b.kind === "code") {
+            return v_flex()
+              .w_full()
+              .min_w(0)
+              .rounded(7)
+              .overflow_hidden()
+              .bg(t.code_bg ?? t.surface ?? t.raised)
+              .border_1()
+              .border_color(t.border)
+              .when(Boolean(b.lang), (el) =>
+                el.child(
+                  div()
+                    .px(10)
+                    .py(3)
+                    .border_b(1)
+                    .border_color(t.border)
+                    .text_size(10)
+                    .text_color(t.dim)
+                    .child(b.lang),
+                ),
+              )
+              .child(
+                div()
+                  .w_full()
+                  .min_w(0)
+                  .px(10)
+                  .py(7)
+                  .font_family(mono)
+                  .text_size(11.5)
+                  .line_height("17px")
+                  .text_color(t.foreground)
+                  .whitespace_normal()
+                  .child(b.text || " "),
+              );
+          }
+
+          const headingMatch = b.text.match(/^(#{1,4})\s+([\s\S]+)$/);
+          if (headingMatch && !headingMatch[2].includes("\n")) {
+            const lvl = headingMatch[1].length;
+            return div()
+              .w_full()
+              .min_w(0)
+              .pt(lvl <= 2 ? 3 : 1)
+              .text_size(lvl === 1 ? 14.5 : lvl === 2 ? 13.5 : 13)
+              .line_height("20px")
+              .font_semibold()
+              .text_color(t.foreground)
+              .whitespace_normal()
+              .child(cleanInlineMarkdown(headingMatch[2]));
+          }
+
+          return div()
+            .w_full()
+            .min_w(0)
+            .text_size(13)
+            .line_height("20px")
+            .text_color(t.foreground)
+            .whitespace_normal()
+            .child(cleanInlineMarkdown(b.text));
+        }),
+      );
+  }
+
   renderActivityStep(step, t) {
     if (step.kind === "thought") {
       return v_flex()
         .id(`sess-step-${step.idx}`)
         .w_full()
         .min_w(0)
-        .px(8)
-        .py(5)
+        .py(2)
         .gap(2)
-        .rounded(5)
-        .bg(t.background)
-        .border_l(2)
-        .border_color(t.border)
-        .child(
-          div()
-            .text_size(10)
-            .font_medium()
-            .text_color(t.dim)
-            .child(tr("💭 Thinking", "💭 思考过程")),
-        )
         .child(
           div()
             .w_full()
@@ -674,14 +1065,11 @@ export default class Sessions extends View {
         .id(`sess-step-${step.idx}`)
         .w_full()
         .min_w(0)
-        .px(7)
-        .py(3)
+        .py(1.5)
         .gap(6)
         .items_center()
-        .rounded(5)
-        .bg(t.background)
-        .child(div().flex_none().text_size(10).text_color(t.dim).child("▸"))
-        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.muted).child(step.title));
+        .child(div().flex_none().text_size(10).text_color(t.dim).child("·"))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(step.title));
     }
 
     if (step.kind === "plan") {
@@ -689,20 +1077,18 @@ export default class Sessions extends View {
         .id(`sess-step-${step.idx}`)
         .w_full()
         .min_w(0)
-        .px(7)
-        .py(3)
+        .py(1.5)
         .gap(6)
         .items_center()
-        .rounded(5)
-        .bg(t.background)
         .child(div().flex_none().text_size(10).text_color(t.dim).child("☰"))
-        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.muted).child(step.summary));
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(step.summary));
     }
 
     return null;
   }
 
-  renderGroupedItem(item, t) {
+  renderGroupedItem(item, t, activeVisual) {
+    // Minimal, feather-light inline disclosure for thinking & tool calls (collapsed by default)
     if (item.kind === "activity_group") {
       const isOpen = this.expandAllSteps || this.expandedGroups.has(item.id);
       const summaryLabel = formatActivityGroupSummary(item);
@@ -714,43 +1100,19 @@ export default class Sessions extends View {
         .child(
           h_flex()
             .id(`sess-act-toggle-${item.id}`)
-            .w_full()
             .min_w(0)
-            .h(24)
-            .px(8)
-            .gap(6)
+            .h(22)
+            .px(4)
+            .gap(5)
             .items_center()
-            .rounded(6)
-            .bg(t.surface ?? t.raised)
-            .border_1()
-            .border_color(t.border)
+            .rounded(5)
             .cursor_pointer()
-            .hover((s) => s.bg(t.hover))
+            .text_color(t.dim)
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => this.toggleActivityGroup(item.id, cx))
-            .child(
-              div()
-                .flex_none()
-                .text_size(10)
-                .text_color(t.dim)
-                .child(isOpen ? "▾" : "▸"),
-            )
-            .child(
-              div()
-                .flex_1()
-                .min_w(0)
-                .truncate()
-                .text_size(11)
-                .text_color(t.muted)
-                .child(summaryLabel),
-            )
-            .child(
-              div()
-                .flex_none()
-                .text_size(10)
-                .text_color(t.dim)
-                .child(isOpen ? tr("Collapse", "收起") : tr("Expand", "展开")),
-            ),
+            .child(div().flex_none().text_size(10).child(isOpen ? "▾" : "▸"))
+            .child(div().min_w(0).truncate().text_size(11.5).child(summaryLabel)),
         )
         .when(isOpen, (el) =>
           el.child(
@@ -758,33 +1120,28 @@ export default class Sessions extends View {
               .id(`sess-act-body-${item.id}`)
               .w_full()
               .min_w(0)
-              .pl(8)
-              .pr(4)
-              .py(4)
-              .gap(4)
-              .rounded(6)
-              .bg(t.surface ?? t.raised)
+              .ml(8)
+              .pl(10)
+              .py(2)
+              .gap(3)
+              .border_l(1)
+              .border_color(t.border)
               .children(item.steps.map((st) => this.renderActivityStep(st, t)).filter(Boolean)),
           ),
         );
     }
 
     if (item.kind === "user") {
-      const entry = item.entry;
-      const clock = formatEntryClock(entry?.ts_ms);
-      const turn = Number(entry?.turn) || 0;
-      const body = clipBodyText(entry?.text);
+      const clock = formatEntryClock(item.entry?.ts_ms);
       return v_flex()
         .id(`sess-entry-${item.idx}`)
         .w_full()
         .min_w(0)
-        .px(10)
-        .py(8)
+        .px(12)
+        .py(9)
         .gap(4)
-        .rounded(8)
+        .rounded(10)
         .bg(t.message ?? t.raised)
-        .border_1()
-        .border_color(t.border)
         .child(
           h_flex()
             .w_full()
@@ -793,34 +1150,22 @@ export default class Sessions extends View {
             .child(
               div()
                 .text_size(11)
-                .font_semibold()
-                .text_color(t.accent ?? t.foreground)
-                .child(tr("You", "用户")),
-            )
-            .when(turn > 0, (el) =>
-              el.child(
-                div()
-                  .px(4)
-                  .py(0.5)
-                  .rounded(4)
-                  .bg(t.background)
-                  .text_size(9.5)
-                  .text_color(t.dim)
-                  .child(`T${turn}`),
-              ),
+                .font_medium()
+                .text_color(t.muted)
+                .child(tr("You", "提问")),
             )
             .child(div().flex_1())
-            .when(Boolean(clock), (el) => el.child(div().text_size(10).text_color(t.dim).child(clock))),
+            .when(Boolean(clock), (el) => el.child(div().text_size(10.5).text_color(t.dim).child(clock))),
         )
         .child(
           div()
             .w_full()
             .min_w(0)
-            .text_size(12.5)
-            .line_height("19px")
+            .text_size(13)
+            .line_height("20px")
             .text_color(t.foreground)
             .whitespace_normal()
-            .child(body || " "),
+            .child(item.body),
         );
     }
 
@@ -831,33 +1176,25 @@ export default class Sessions extends View {
         .w_full()
         .min_w(0)
         .px(4)
-        .py(4)
-        .gap(3)
+        .py(2)
+        .gap(5)
         .child(
           h_flex()
             .w_full()
             .gap(6)
             .items_center()
+            .child(renderAgentIcon(activeVisual, 13, t))
             .child(
               div()
-                .text_size(11)
-                .font_semibold()
+                .text_size(11.5)
+                .font_medium()
                 .text_color(t.muted)
-                .child(this.agentName || tr("Assistant", "助手")),
+                .child(this.agentName || activeVisual.name),
             )
             .child(div().flex_1())
-            .when(Boolean(clock), (el) => el.child(div().text_size(10).text_color(t.dim).child(clock))),
+            .when(Boolean(clock), (el) => el.child(div().text_size(10.5).text_color(t.dim).child(clock))),
         )
-        .child(
-          div()
-            .w_full()
-            .min_w(0)
-            .text_size(12.5)
-            .line_height("19px")
-            .text_color(t.foreground)
-            .whitespace_normal()
-            .child(item.body),
-        );
+        .child(this.renderAssistantFormatted(item.body, t));
     }
 
     if (item.kind === "error") {
@@ -865,11 +1202,11 @@ export default class Sessions extends View {
         .id(`sess-entry-${item.idx}`)
         .w_full()
         .min_w(0)
-        .px(8)
-        .py(4)
-        .rounded(6)
+        .px(10)
+        .py(6)
+        .rounded(7)
         .bg(t.raised)
-        .text_size(11.5)
+        .text_size(12)
         .text_color(t.ansi1 ?? t.foreground)
         .whitespace_normal()
         .child(item.msg);
@@ -878,67 +1215,188 @@ export default class Sessions extends View {
     return null;
   }
 
-  renderHoverCard(hovered, t) {
-    if (!hovered) return null;
-    const fullTitle = cleanSingleLine(hovered.title || hovered.session_id, 220);
-    const metaParts = [
-      `ID: ${shortSessionId(hovered.session_id)}`,
-      hovered.git_branch ? `${tr("Branch", "分支")}: ${hovered.git_branch}` : "",
-      tr("Right-click to copy full-access resume command", "右键点击可复制 Full Access 恢复命令"),
-    ].filter(Boolean);
+  renderAgentPickerPopup(liveCtx, effectiveAgent, catalog, t) {
+    const activeVisual = getAgentVisual(effectiveAgent, catalog);
+    const targetKey = liveCtx.target || `space:${liveCtx.cwd || ""}`;
+    const hasManualOverride = this.manualOverrideByTarget.has(targetKey);
 
-    return v_flex()
-      .id("sessions-hover-tip")
-      .absolute()
-      .left(8)
-      .right(14)
-      .when(this.hoverAtBottom, (el) => el.bottom(6))
-      .when(!this.hoverAtBottom, (el) => el.top(6))
-      .px(9)
-      .py(6)
-      .gap(2)
-      .rounded(7)
-      .bg(t.popover ?? t.raised)
+    const trigger = h_flex()
+      .id("sessions-agent-trigger")
+      .h(26)
+      .px(8)
+      .gap(6)
+      .flex_none()
+      .items_center()
+      .rounded(6)
+      .bg(this.agentPopupOpen ? (t.selected ?? t.raised) : (t.surface ?? t.background))
       .border_1()
+      .border_color(this.agentPopupOpen ? (t.accent ?? t.border) : t.border)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        this.agentPopupOpen = !this.agentPopupOpen;
+        cx.notify();
+      })
+      .child(renderAgentIcon(activeVisual, 14, t))
+      .child(
+        div()
+          .text_size(12)
+          .font_semibold()
+          .text_color(t.foreground)
+          .child(activeVisual.name),
+      )
+      .child(div().text_size(10).text_color(t.dim).child("▾"));
+
+    return Popup.new("sessions-agent-popup", trigger)
+      .anchor("bottom_left")
+      .when(this.agentPopupOpen, (el) =>
+        el.content(
+          v_flex()
+            .id("sessions-agent-menu")
+            .w(216)
+            .max_h(280)
+            .p(4)
+            .gap(2)
+            .rounded(8)
+            .bg(t.popover ?? t.raised)
+            .border_1()
+            .border_color(t.border)
+            .overflow_y_scroll()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .when(Boolean(liveCtx.detectedAgent && hasManualOverride), (menu) => {
+              const detVis = getAgentVisual(liveCtx.detectedAgent, catalog);
+              return menu
+                .child(
+                  h_flex()
+                    .id("sessions-agent-opt-auto")
+                    .h(29)
+                    .px(8)
+                    .gap(8)
+                    .items_center()
+                    .rounded(6)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover))
+                    .on_click((_e, cx) => this.chooseAgent(null, liveCtx, cx))
+                    .child(renderAgentIcon(detVis, 14, t))
+                    .child(
+                      div()
+                        .flex_1()
+                        .min_w(0)
+                        .truncate()
+                        .text_size(12)
+                        .text_color(t.foreground)
+                        .child(tr(`Follow tab (${detVis.name})`, `跟随当前标签页 (${detVis.name})`)),
+                    ),
+                )
+                .child(div().h(1).mx(4).my(2).bg(t.border));
+            })
+            .children(
+              catalog.map((item) => {
+                const chosen = item.key === effectiveAgent;
+                return h_flex()
+                  .id(`sessions-agent-opt-${item.key}`)
+                  .h(29)
+                  .px(8)
+                  .gap(8)
+                  .items_center()
+                  .rounded(6)
+                  .cursor_pointer()
+                  .when(chosen, (r) => r.bg(t.selected))
+                  .hover((s) => s.bg(chosen ? t.selected : t.hover))
+                  .on_click((_e, cx) => this.chooseAgent(item.key, liveCtx, cx))
+                  .child(renderAgentIcon(item, 14, t))
+                  .child(
+                    div()
+                      .flex_1()
+                      .min_w(0)
+                      .truncate()
+                      .text_size(12)
+                      .text_color(t.foreground)
+                      .child(item.name),
+                  )
+                  .when(chosen, (r) =>
+                    r.child(div().text_size(11).text_color(t.accent ?? t.foreground).child("✓")),
+                  );
+              }),
+            ),
+        ),
+      );
+  }
+
+  renderTerminalQuickAgentBar(liveCtx, effectiveAgent, catalog, t) {
+    // Quick 1-click CLI agent switcher shown when the user is on a plain Terminal tab.
+    const quickChoices = catalog.filter((a) => a.installed);
+    const pills = (quickChoices.length > 0 ? quickChoices : catalog).slice(0, 6);
+    if (pills.length === 0) return null;
+
+    return h_flex()
+      .id("sessions-terminal-agent-bar")
+      .flex_none()
+      .w_full()
+      .min_w(0)
+      .px(10)
+      .py(6)
+      .gap(5)
+      .flex_wrap()
+      .items_center()
+      .bg(t.surface ?? t.background)
+      .border_b(1)
       .border_color(t.border)
       .child(
         div()
-          .w_full()
-          .min_w(0)
-          .text_size(11.5)
-          .line_height("16px")
-          .font_medium()
-          .text_color(t.foreground)
-          .whitespace_normal()
-          .child(fullTitle),
+          .flex_none()
+          .text_size(11)
+          .text_color(t.dim)
+          .mr(2)
+          .child(tr("Agent:", "选择 Agent：")),
       )
-      .child(
-        div()
-          .w_full()
-          .min_w(0)
-          .truncate()
-          .text_size(10.5)
-          .text_color(t.muted)
-          .child(metaParts.join(" · ")),
+      .children(
+        pills.map((item) => {
+          const active = item.key === effectiveAgent;
+          return h_flex()
+            .id(`sessions-agent-pill-${item.key}`)
+            .h(24)
+            .px(8)
+            .gap(5)
+            .flex_none()
+            .items_center()
+            .rounded(6)
+            .cursor_pointer()
+            .bg(active ? (t.selected ?? t.raised) : t.background)
+            .border_1()
+            .border_color(active ? (t.accent ?? t.border) : t.border)
+            .text_color(active ? t.foreground : t.muted)
+            .hover((s) => s.bg(active ? (t.selected ?? t.raised) : t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => this.chooseAgent(item.key, liveCtx, cx))
+            .child(renderAgentIcon(item, 12, t))
+            .child(
+              div()
+                .text_size(11.5)
+                .when(active, (e) => e.font_medium())
+                .child(item.name),
+            );
+        }),
       );
   }
 
   render(cx) {
-    const liveCtx = resolveActiveCliContext();
-    if (this.computeContextKey(liveCtx) !== this.context && (typeof checking !== "function" || !checking())) {
+    const liveCtx = resolveActiveTerminalContext();
+    const effectiveAgent = liveCtx.supported ? this.resolveEffectiveAgent(liveCtx) : null;
+    if (this.computeContextKey(liveCtx, effectiveAgent) !== this.context && (typeof checking !== "function" || !checking())) {
       this.refresh(cx, false);
     }
 
     const t = theme();
     const accent = t.accent ?? "#3b82f6";
+    const catalog = this.agentCatalogFor(liveCtx.machine);
+    const activeVisual = getAgentVisual(this.agent || effectiveAgent, catalog);
     const filtered = this.filteredSessions();
     const query = String(this.searchInput?.value?.() ?? "");
     const wsFolder = this.cwd || liveCtx.cwd || "";
-    const wsName = folderBasename(wsFolder) || tr("Workspace", "当前工作区");
-    const agentBadge = this.agentName || liveCtx.agent || "CLI";
-
-    const rowHeight = 36;
-    const rowGap = 3;
+    const wsName = folderBasename(wsFolder) || tr("Workspace", "当前目录");
 
     const groupedItems = groupTranscriptItems(this.entries);
     const activityGroupCount = groupedItems.reduce((n, it) => n + (it.kind === "activity_group" ? 1 : 0), 0);
@@ -949,7 +1407,7 @@ export default class Sessions extends View {
     const visibleItems = totalItems > 0 ? groupedItems.slice(hiddenCount) : [];
     const renderedEntries = [];
     for (let i = 0; i < visibleItems.length; i++) {
-      const node = this.renderGroupedItem(visibleItems[i], t);
+      const node = this.renderGroupedItem(visibleItems[i], t, activeVisual);
       if (node) renderedEntries.push(node);
     }
 
@@ -957,41 +1415,16 @@ export default class Sessions extends View {
       || (this.selectedId ? this.sessions.find((s) => s?.session_id === this.selectedId) : null)
       || null;
 
-    const activeHover =
-      this.hoveredSession
-      && Date.now() >= this.hoverSuppressedUntil
-      && filtered.some((s) => s.session_id === this.hoveredSession.session_id)
-        ? this.hoveredSession
-        : null;
+    const justCopied = Boolean(selected && this.copiedSessionId === selected.session_id && Date.now() < this.copiedUntil);
 
+    // Upper pane: clean, breathable session list (no floating tooltips -> zero overlap with right-click menu)
     const sessionListPane = div()
       .id("sessions-list-pane")
       .size_full()
       .min_h(0)
       .relative()
-      .on_size_change((sz) => {
-        const h = sz && typeof sz.height === "number" ? sz.height / zoomScale() : 0;
-        if (h > 0) this.listPaneHeight = h;
-      })
-      .on_mouse_move((e, cx) => {
-        const rawY = e?.local_position?.y;
-        if (typeof rawY === "number" && this.listPaneHeight > 0) {
-          this.hasPointerY = true;
-          const wantBottom = (rawY / zoomScale()) < this.listPaneHeight * 0.52;
-          if (wantBottom !== this.hoverAtBottom) {
-            this.hoverAtBottom = wantBottom;
-            if (this.hoveredSession) cx.notify();
-          }
-        }
-      })
-      .on_hover((inside, cx) => {
-        if (!inside) {
-          this.hasPointerY = false;
-          if (this.hoveredSession) {
-            this.hoveredSession = null;
-            cx.notify();
-          }
-        }
+      .on_mouse_down("left", () => {
+        if (this.agentPopupOpen) this.agentPopupOpen = false;
       })
       .child(
         v_flex()
@@ -999,143 +1432,185 @@ export default class Sessions extends View {
           .absolute()
           .inset_0()
           .overflow_y_scroll()
-          .p(6)
-          .gap(rowGap)
+          .px(8)
+          .py(6)
+          .gap(3)
           .children(
             filtered.map((s, idx) => {
               const isSel = selected?.session_id === s.session_id;
-              const relTime = formatRelativeTime(s.updated_ms || s.created_ms);
+              const isHovered = this.hoveredRowId === s.session_id;
+              const relTime = formatFriendlyTime(s.updated_ms || s.created_ms);
               const turns = Number(s.turns) || 0;
-              const title = cleanSingleLine(s.title || s.session_id, 120);
+              const title = formatCleanSessionTitle(s.title || s.session_id, 110);
 
-              return h_flex()
+              const subMeta = [];
+              if (turns > 0) subMeta.push(tr(`${turns} turn${turns === 1 ? "" : "s"}`, `${turns} 轮对话`));
+              if (s.git_branch) subMeta.push(s.git_branch);
+
+              return v_flex()
                 .id(`session-row-${idx}`)
-                .h(rowHeight)
                 .flex_none()
                 .w_full()
                 .min_w(0)
-                .px(8)
-                .gap(7)
-                .items_center()
-                .rounded(7)
+                .px(10)
+                .py(7)
+                .gap(3)
+                .rounded(8)
                 .overflow_hidden()
                 .cursor_pointer()
                 .when(isSel, (e) => e.bg(t.selected))
                 .hover((st) => st.bg(isSel ? t.selected : t.hover))
                 .on_hover((hovered, cx) => {
-                  if (hovered) {
-                    if (Date.now() < this.hoverSuppressedUntil) return;
-                    if (this.hoveredSession?.session_id !== s.session_id) {
-                      this.hoveredSession = s;
-                      if (!this.hasPointerY && this.listPaneHeight > 0) {
-                        const estCenterY = 6 + idx * (rowHeight + rowGap) + rowHeight * 0.5;
-                        this.hoverAtBottom = estCenterY < this.listPaneHeight * 0.52;
-                      }
-                      cx.notify();
-                    }
-                  } else if (this.hoveredSession?.session_id === s.session_id) {
-                    this.hoveredSession = null;
+                  const next = hovered ? s.session_id : (this.hoveredRowId === s.session_id ? null : this.hoveredRowId);
+                  if (next !== this.hoveredRowId) {
+                    this.hoveredRowId = next;
                     cx.notify();
                   }
                 })
-                .on_mouse_down("left", (_e, cx) => this.dismissHover(cx, 300))
-                .on_click((_e, cx) => this.selectSession(s, cx))
+                .on_click((_e, cx) => {
+                  this.agentPopupOpen = false;
+                  this.selectSession(s, cx);
+                })
                 .on_mouse_down("right", (_e, cx) => this.openSessionMenu(s, cx))
                 .child(
-                  div()
-                    .w(3)
-                    .h(16)
-                    .flex_none()
-                    .rounded(999)
-                    .bg(isSel ? accent : (s.current ? (t.ansi2 ?? accent) : "#00000000")),
-                )
-                .child(
-                  div()
-                    .flex_1()
+                  h_flex()
+                    .w_full()
                     .min_w(0)
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .truncate()
-                    .text_size(12.5)
-                    .line_height("20px")
-                    .font_medium()
-                    .text_color(isSel ? t.foreground : (t.foreground ?? "#f4f4f5"))
-                    .child(title),
+                    .gap(7)
+                    .items_center()
+                    .when(Boolean(s.current), (e) =>
+                      e.child(
+                        div()
+                          .size(6)
+                          .flex_none()
+                          .rounded(999)
+                          .bg(t.ansi2 ?? accent),
+                      ),
+                    )
+                    .child(
+                      div()
+                        .flex_1()
+                        .min_w(0)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .truncate()
+                        .text_size(12.5)
+                        .line_height("18px")
+                        .when(isSel, (e) => e.font_semibold())
+                        .when(!isSel, (e) => e.font_medium())
+                        .text_color(t.foreground)
+                        .child(title),
+                    )
+                    .when(Boolean(s.current), (e) =>
+                      e.child(
+                        div()
+                          .flex_none()
+                          .whitespace_nowrap()
+                          .text_size(10.5)
+                          .text_color(t.ansi2 ?? accent)
+                          .child(tr("Current", "当前")),
+                      ),
+                    )
+                    .when(Boolean(relTime), (e) =>
+                      e.child(
+                        div()
+                          .flex_none()
+                          .whitespace_nowrap()
+                          .text_size(11)
+                          .text_color(t.dim)
+                          .child(relTime),
+                      ),
+                    ),
                 )
-                .when(Boolean(s.current), (e) =>
-                  e.child(
-                    div()
-                      .flex_none()
-                      .whitespace_nowrap()
-                      .px(5)
-                      .py(1)
-                      .rounded(4)
-                      .bg(t.raised)
-                      .text_size(10)
-                      .text_color(t.ansi2 ?? accent)
-                      .child(tr("Current", "当前")),
-                  ),
-                )
-                .when(turns > 0, (e) =>
-                  e.child(
-                    div()
-                      .flex_none()
-                      .whitespace_nowrap()
-                      .text_size(10.5)
-                      .text_color(t.dim)
-                      .child(`T${turns}`),
-                  ),
-                )
-                .when(Boolean(relTime), (e) =>
-                  e.child(
-                    div()
-                      .flex_none()
-                      .whitespace_nowrap()
-                      .text_size(10.5)
-                      .text_color(t.dim)
-                      .child(relTime),
+                .when(subMeta.length > 0 || isSel || isHovered, (el) =>
+                  el.child(
+                    h_flex()
+                      .w_full()
+                      .min_w(0)
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .truncate()
+                          .text_size(11)
+                          .text_color(t.dim)
+                          .child(subMeta.join(" · ") || shortNameFallback(s.session_id)),
+                      )
+                      .when(isSel || isHovered, (r) =>
+                        r.child(
+                          div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(10.5)
+                            .text_color(t.muted)
+                            .child(tr("Right-click to copy command", "右键复制恢复命令")),
+                        ),
+                      ),
                   ),
                 );
             }),
           )
           .when(filtered.length === 0, (el) =>
             el.child(
-              div()
-                .p(10)
-                .text_size(12)
-                .text_color(t.dim)
-                .whitespace_normal()
+              v_flex()
+                .w_full()
+                .px(12)
+                .py(20)
+                .gap(4)
+                .items_center()
+                .justify_center()
                 .child(
-                  this.error
-                    || (this.loadingList
-                      ? tr("Scanning workspace sessions…", "正在扫描当前工作区历史会话…")
-                      : query.length > 0
-                        ? tr("No matching sessions", "未找到匹配的历史会话")
-                        : tr("No historical sessions found for this workspace and CLI agent", "当前工作区与当前 CLI Agent 暂无历史会话")),
+                  div()
+                    .text_size(12.5)
+                    .text_color(t.muted)
+                    .whitespace_normal()
+                    .child(
+                      this.error
+                        || (this.loadingList
+                          ? tr("Loading session history…", "正在读取历史会话…")
+                          : query.length > 0
+                            ? tr("No matching sessions", "没有匹配的历史会话")
+                            : tr(
+                                `No ${activeVisual.name} sessions in ${wsName}`,
+                                `当前目录暂无 ${activeVisual.name} 的历史会话`,
+                              )),
+                    ),
+                )
+                .when(!this.loadingList && !this.error && query.length === 0 && liveCtx.isPlainTerminal, (sub) =>
+                  sub.child(
+                    div()
+                      .text_size(11)
+                      .text_color(t.dim)
+                      .child(tr("Switch agent above to inspect another CLI agent", "可在上方切换其他 CLI Agent 查看历史会话")),
+                  ),
                 ),
             ),
           ),
       )
-      .child(Scrollbar.vertical("sessions-list").absolute().inset_0())
-      .when(Boolean(activeHover), (el) => el.child(this.renderHoverCard(activeHover, t)));
+      .child(Scrollbar.vertical("sessions-list").absolute().inset_0());
 
+    // Lower pane: clean, editorial conversation detail
     const transcriptDetailPane = v_flex()
       .id("sessions-detail-pane")
       .size_full()
       .min_w(0)
       .min_h(0)
-      // Selected session toolbar
+      .on_mouse_down("left", () => {
+        if (this.agentPopupOpen) this.agentPopupOpen = false;
+      })
       .child(
         h_flex()
           .id("sessions-detail-toolbar")
-          .h(30)
+          .h(36)
           .flex_none()
           .w_full()
           .min_w(0)
-          .px(10)
-          .gap(6)
+          .px(12)
+          .gap(8)
           .items_center()
-          .bg(t.raised)
+          .bg(t.surface ?? t.raised)
           .border_b(1)
           .border_color(t.border)
           .when(Boolean(selected), (el) =>
@@ -1146,13 +1621,13 @@ export default class Sessions extends View {
               .flex_1()
               .min_w(0)
               .truncate()
-              .text_size(11)
+              .text_size(12)
               .font_medium()
-              .text_color(t.muted)
+              .text_color(selected ? t.foreground : t.muted)
               .child(
                 selected
-                  ? cleanSingleLine(selected.title || selected.session_id, 100)
-                  : tr("Conversation History", "会话内容"),
+                  ? formatCleanSessionTitle(selected.title || selected.session_id, 90)
+                  : tr("Conversation", "对话内容"),
               ),
           )
           .when(activityGroupCount > 0, (el) =>
@@ -1160,51 +1635,46 @@ export default class Sessions extends View {
               div()
                 .id("sessions-toggle-steps")
                 .flex_none()
-                .px(6)
-                .py(1.5)
-                .rounded(4)
-                .bg(anyStepsOpen ? (t.selected ?? t.background) : t.background)
-                .border_1()
-                .border_color(t.border)
-                .text_size(10)
-                .text_color(anyStepsOpen ? t.foreground : t.muted)
+                .px(7)
+                .py(2)
+                .rounded(5)
+                .text_size(11)
+                .text_color(anyStepsOpen ? t.foreground : t.dim)
                 .cursor_pointer()
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
                 .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                 .on_click((_e, cx) => this.toggleAllActivitySteps(cx))
-                .child(anyStepsOpen ? tr("Hide steps", "折叠过程") : tr("Show steps", "展开过程")),
+                .child(
+                  anyStepsOpen
+                    ? tr("Hide steps", "折叠过程")
+                    : tr(`Show steps (${activityGroupCount})`, `展开过程 (${activityGroupCount})`),
+                ),
             ),
           )
-          .when(Boolean(selected?.model), (el) =>
+          .when(Boolean(selected?.resume_command), (el) =>
             el.child(
-              div()
+              h_flex()
+                .id("sessions-copy-cmd")
                 .flex_none()
-                .max_w(130)
-                .truncate()
-                .px(5)
-                .py(1)
-                .rounded(4)
-                .bg(t.background)
-                .text_size(10)
-                .text_color(t.dim)
-                .child(String(selected.model)),
-            ),
-          )
-          .when(Boolean(selected?.session_id), (el) =>
-            el.child(
-              div()
-                .flex_none()
-                .px(5)
-                .py(1)
-                .rounded(4)
-                .bg(t.background)
-                .text_size(10)
-                .text_color(t.dim)
-                .child(shortSessionId(selected.session_id)),
+                .h(24)
+                .px(8)
+                .gap(4)
+                .items_center()
+                .rounded(6)
+                .bg(justCopied ? (t.selected ?? t.raised) : t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(11)
+                .text_color(justCopied ? (t.ansi2 ?? accent) : t.foreground)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => this.copyResumeCommand(selected, cx))
+                .child(svg("mods/peek/copy.svg").size(11).text_color(justCopied ? (t.ansi2 ?? accent) : t.muted))
+                .child(justCopied ? tr("Copied", "已复制") : tr("Copy resume cmd", "复制恢复命令")),
             ),
           ),
       )
-      // Conversation content viewer
       .child(
         div()
           .flex_1()
@@ -1222,20 +1692,19 @@ export default class Sessions extends View {
               .absolute()
               .inset_0()
               .overflow_y_scroll()
-              .p(10)
-              .gap(8)
+              .px(14)
+              .py(12)
+              .gap(12)
               .when(hiddenCount > 0, (el) =>
                 el.child(
                   div()
                     .id("sessions-load-earlier")
                     .w_full()
                     .py(5)
-                    .px(8)
+                    .px(10)
                     .rounded(6)
-                    .bg(t.raised)
-                    .border_1()
-                    .border_color(t.border)
-                    .text_size(11)
+                    .bg(t.surface ?? t.raised)
+                    .text_size(11.5)
                     .text_color(t.muted)
                     .cursor_pointer()
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -1245,8 +1714,8 @@ export default class Sessions extends View {
                     })
                     .child(
                       tr(
-                        `Show earlier items (${hiddenCount} hidden)`,
-                        `显示更早内容（还有 ${hiddenCount} 项）`,
+                        `Show earlier messages (${hiddenCount} more)`,
+                        `显示更早的对话（还有 ${hiddenCount} 项）`,
                       ),
                     ),
                 ),
@@ -1255,23 +1724,27 @@ export default class Sessions extends View {
               .when(renderedEntries.length === 0, (el) =>
                 el.child(
                   div()
-                    .p(8)
-                    .text_size(12)
+                    .py(16)
+                    .text_size(12.5)
                     .text_color(t.dim)
                     .whitespace_normal()
                     .child(
                       this.transcriptError
                         || (this.loadingTranscript
-                          ? tr("Loading session conversation…", "正在加载历史对话内容…")
+                          ? tr("Loading conversation…", "正在加载对话内容…")
                           : selected
                             ? tr("No text messages recorded in this session", "该会话暂无可展示的对话消息")
-                            : tr("Select a session above to view its conversation history", "在上方选择一条历史会话以查看对话内容")),
+                            : tr("Select a session above to read its conversation", "在上方选择一条历史会话查看对话记录")),
                     ),
                 ),
               ),
           )
           .child(Scrollbar.vertical("sessions-transcript").absolute().inset_0()),
       );
+
+    const terminalAgentBar = liveCtx.supported && liveCtx.isPlainTerminal
+      ? this.renderTerminalQuickAgentBar(liveCtx, effectiveAgent, catalog, t)
+      : null;
 
     return v_flex()
       .id("sessions")
@@ -1285,113 +1758,65 @@ export default class Sessions extends View {
       .text_color(t.foreground)
       .text_size(13)
       .track_focus(this.handle)
-      // Header bar: agent + workspace badge + refresh
+      .on_key_down((e, cx) => {
+        if (e.key === "escape" && this.agentPopupOpen) {
+          this.agentPopupOpen = false;
+          cx.stop_propagation();
+          cx.notify();
+        }
+      })
+      // Unified single top bar: Agent selector + workspace folder + compact search + refresh
       .child(
         h_flex()
           .id("sessions-header")
-          .h(36)
+          .h(42)
           .flex_none()
           .w_full()
           .min_w(0)
           .px(10)
-          .gap(6)
+          .gap(8)
           .items_center()
           .bg(t.raised)
           .border_b(1)
           .border_color(t.border)
-          .child(
-            div()
-              .flex_none()
-              .px(6)
-              .py(1.5)
-              .rounded(5)
-              .bg(t.selected ?? t.background)
-              .text_size(11)
-              .font_semibold()
-              .text_color(t.foreground)
-              .child(agentBadge),
+          .when(liveCtx.supported, (el) =>
+            el.child(this.renderAgentPickerPopup(liveCtx, effectiveAgent, catalog, t)),
           )
           .child(
             div()
               .flex_1()
-              .min_w(0)
+              .min_w(40)
               .truncate()
-              .text_size(11.5)
+              .text_size(12)
               .text_color(t.muted)
               .tooltip(wsFolder || wsName)
               .child(wsName),
           )
-          .when(this.sessions.length > 0, (el) =>
-            el.child(
-              div()
-                .flex_none()
-                .px(5)
-                .py(1)
-                .rounded(999)
-                .bg(t.background)
-                .text_size(10.5)
-                .text_color(t.dim)
-                .child(String(filtered.length)),
-            ),
-          )
-          .child(
-            div()
-              .id("sessions-refresh")
-              .size(24)
-              .flex_none()
-              .flex()
-              .items_center()
-              .justify_center()
-              .rounded(5)
-              .text_color(t.muted)
-              .cursor_pointer()
-              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .tooltip(tr("Refresh sessions", "刷新历史会话"))
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => this.refresh(cx, false))
-              .child(
-                svg(this.loadingList ? "mods/workspace-chrome/spinner.svg" : "frame/settings/refresh.svg")
-                  .size(13)
-                  .when(this.loadingList, (s) => s.spin(900)),
-              ),
-          ),
-      )
-      // Search bar
-      .child(
-        h_flex()
-          .id("sessions-search-bar")
-          .h(34)
-          .flex_none()
-          .w_full()
-          .min_w(0)
-          .px(8)
-          .gap(6)
-          .items_center()
-          .border_b(1)
-          .border_color(t.border)
-          .bg(t.surface ?? t.background)
           .child(
             h_flex()
               .id("sessions-search-wrap")
-              .flex_1()
-              .min_w(0)
-              .h(24)
+              .w(156)
+              .flex_none()
+              .h(26)
               .px(8)
-              .gap(5)
+              .gap(4)
               .items_center()
               .rounded(6)
               .bg(t.background)
               .border_1()
               .border_color(this.searchFocused ? accent : t.border)
               .cursor_text()
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .child(Input.new(this.searchInput).h_full().text_size(11.5).text_color(t.foreground))
+              .on_mouse_down("left", (_e, cx) => {
+                cx.stop_propagation();
+                if (this.agentPopupOpen) this.agentPopupOpen = false;
+              })
+              .child(Input.new(this.searchInput).flex_1().min_w(0).h_full().text_size(11.5).text_color(t.foreground))
               .when(query.length > 0, (el) =>
                 el.child(
                   div()
                     .id("sessions-search-clear")
                     .flex_none()
-                    .px(4)
+                    .px(3)
                     .rounded(4)
                     .text_size(11)
                     .text_color(t.dim)
@@ -1404,8 +1829,34 @@ export default class Sessions extends View {
                     .child("×"),
                 ),
               ),
+          )
+          .child(
+            div()
+              .id("sessions-refresh")
+              .size(26)
+              .flex_none()
+              .flex()
+              .items_center()
+              .justify_center()
+              .rounded(6)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .tooltip(tr("Refresh", "刷新"))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                this.agentPopupOpen = false;
+                this.refresh(cx, false);
+              })
+              .child(
+                svg(this.loadingList ? "mods/workspace-chrome/spinner.svg" : "frame/settings/refresh.svg")
+                  .size(13)
+                  .when(this.loadingList, (s) => s.spin(900)),
+              ),
           ),
       )
+      // When in a plain Terminal tab, show prominent 1-click CLI Agent pills
+      .when(Boolean(terminalAgentBar), (el) => el.child(terminalAgentBar))
       // Vertically resizable split between session list (top) and conversation detail (bottom)
       .child(
         v_resizable("sessions-split")
@@ -1431,9 +1882,15 @@ export default class Sessions extends View {
           )
           .child(
             resizable_panel()
-              .size_range(120)
+              .size_range(140)
               .child(transcriptDetailPane),
           ),
       );
   }
+}
+
+function shortNameFallback(sid) {
+  const s = String(sid ?? "").trim();
+  if (s.length <= 12) return s;
+  return `${s.slice(0, 8)}…`;
 }

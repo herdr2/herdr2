@@ -8214,10 +8214,10 @@ export default class Settings extends View {
     const handoverCompact = (cfg.ai?.handoverCompact ?? switches.handoverCompact) !== false;
     const autoTitle = (cfg.ai?.autoTitle ?? switches.autoTitle) !== false;
     const taskEnrich = (cfg.ai?.taskEnrich ?? switches.taskEnrich) !== false;
-    const conflictPolicy = cfg.ai?.conflictPolicy ?? switches.conflictPolicy ?? "warn";
+    const conflictPolicy = cfg.ai?.conflictPolicy ?? switches.conflictPolicy ?? "auto_worktree";
     const rawQuestionMode = cfg.ai?.questionMode ?? switches.questionMode ?? "draft";
     const questionMode = rawQuestionMode === "auto" ? "auto_when_offline" : rawQuestionMode;
-    const loopDetect = cfg.ai?.loopDetect ?? switches.loopDetect ?? "off";
+    const loopDetect = cfg.ai?.loopDetect ?? switches.loopDetect ?? "steer_once";
     const conflictOptions = [
       { value: "off", label: this.tr("Off", "关闭 (off)") },
       { value: "warn", label: this.tr("Warn", "告警提示 (warn)") },
