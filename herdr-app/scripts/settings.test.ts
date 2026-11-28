@@ -588,6 +588,54 @@ test("buildUpdateModal handles available updates, up-to-date, and check errors",
     message: "curl: (7) Failed to connect",
     missingUrl: false,
   });
+
+  // App is already latest, but bundled Linux core (system package manager) is outdated and self-updatable via elevation
+  const bundledCoreOnly = view.buildUpdateModal({
+    app: { version: "2.0.22", ready: null, needs_elevation: true },
+    ui: { version: "2.0.22", ready: null },
+    core: {
+      version: "2.0.21",
+      ready: "2.0.22",
+      managed: "system package manager",
+      can_update: true,
+      needs_elevation: true,
+    },
+    available: {
+      kind: "core",
+      version: "2.0.22",
+      restart: false,
+      needs_elevation: true,
+      items: [{ kind: "core", current: "2.0.21", next: "2.0.22" }],
+    },
+    last_error: null,
+  });
+  expect(bundledCoreOnly.kind).toBe("available");
+  expect(bundledCoreOnly.version).toBe("2.0.22");
+  expect(bundledCoreOnly.restart).toBe(false);
+  expect(bundledCoreOnly.needsElevation).toBe(true);
+  expect(bundledCoreOnly.items).toEqual([{ kind: "core", current: "2.0.21", next: "2.0.22" }]);
+
+  // App is already latest, externally managed core (e.g. homebrew) is outdated -> must NOT report up_to_date
+  const managedCoreOnly = view.buildUpdateModal({
+    app: { version: "2.0.22", ready: null },
+    ui: { version: "2.0.22", ready: null },
+    core: {
+      version: "2.0.21",
+      ready: "2.0.22",
+      managed: "homebrew",
+      can_update: false,
+      needs_elevation: false,
+    },
+    available: null,
+    last_error: null,
+  });
+  expect(managedCoreOnly).toEqual({
+    kind: "managed_core_update",
+    version: "2.0.22",
+    current: "2.0.21",
+    managed: "homebrew",
+    appVersion: "2.0.22",
+  });
 });
 
 test("triggerUpdateCheck persists edited releases_url and opens modal when check_seq advances", async () => {

@@ -12458,7 +12458,7 @@ impl AppWindow {
             return Some(format!("ui:{ver}"));
         }
         let core = crate::update::core();
-        if core.managed.is_none() && !core.updating && let Some(ver) = core.ready {
+        if crate::update::core_can_update() && !core.updating && let Some(ver) = core.ready {
             return Some(format!("core:{ver}"));
         }
         if let Some(ver) = crate::update::remote_ready() {

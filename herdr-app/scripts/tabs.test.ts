@@ -926,6 +926,18 @@ test("top-right update button triggers app.update and turns into a compact spinn
   expect(collectTexts(spinnerBtn)).toEqual([]);
   expect(spinnerBtn.calls.on_click).toBeUndefined();
   expect(spinnerBtn.nodes[0]?.calls?.spin?.[0]).toBe(900);
+
+  // 4) App already latest, bundled Linux core outdated with managed="system package manager" & can_update=true -> still shows Update button
+  updateState = {
+    app: { version: "2.0.22", ready: null, updating: false },
+    ui: { version: "2.0.22", ready: null, applying: false },
+    core: { version: "2.0.21", ready: "2.0.22", managed: "system package manager", can_update: true, updating: false },
+    available: { kind: "core", version: "2.0.22", needs_elevation: true },
+    updating: false,
+  };
+  const coreBtn = findById(view.render(), "top-update-btn");
+  expect(coreBtn).not.toBeNull();
+  expect(collectTexts(coreBtn)).toEqual(["更新"]);
 });
 
 test("tab bar renders a reopen button on the left only when the sidebar is hidden", () => {

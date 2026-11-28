@@ -924,8 +924,9 @@ export default class Tabs extends View {
       const remoteUpdating = machines.some((m) => m?.updating);
       const remotePending = machines.filter((m) => m && (m.ready || m.raw_state === "needs_update"));
       const avail = updateState.available ?? null;
+      const coreCanUpdate = Boolean(core.ready && (core.can_update ?? !core.managed));
       const busy = Boolean(updateState.updating || app.updating || ui.applying || core.updating || remoteUpdating);
-      const hasUpdate = Boolean(avail || app.ready || ui.ready || (core.ready && !core.managed) || remotePending.length > 0);
+      const hasUpdate = Boolean(avail || app.ready || ui.ready || coreCanUpdate || remotePending.length > 0);
       if (!busy && !hasUpdate) return null;
       const accent = t.accent ?? "#3b82f6";
       if (busy) {
@@ -963,7 +964,7 @@ export default class Tabs extends View {
               `UI hot-update v${nextVer} is available. Click to update live without restarting.`,
               `发现 UI 热更新 v${nextVer}，点击后后台自动免重启更新。`,
             )
-          : (core.ready && !core.managed)
+          : coreCanUpdate
             ? (hasRemotes
                 ? tr(
                     `h2 Core v${nextVer} is available. Click to update local and all SSH remote hosts in background.`,

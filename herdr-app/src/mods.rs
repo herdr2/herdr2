@@ -996,8 +996,7 @@ pub fn set_live_core(core: &std::sync::Arc<crate::hc::Core>) {
     }
 }
 
-#[cfg(not(test))]
-fn live_core() -> Option<std::sync::Arc<crate::hc::Core>> {
+pub(crate) fn live_core() -> Option<std::sync::Arc<crate::hc::Core>> {
     LIVE_CORE.lock().ok().and_then(|slot| slot.as_ref()?.upgrade())
 }
 

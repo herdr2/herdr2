@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.0.23
+
+#### 中文
+
+**问题修复**
+- **修复桌面端已升级到最新版但 `herdr2-core` 落后时误报「已是最新版本」且无法升级的严重问题**：
+  - 修复 Linux `.deb`（`/opt/herdr2/herdr2-core`）等只读目录安装的内置 `herdr2-core` 在 `herdr2-app` 已是最新（`app.ready == null`）时因 `installed_by = "system package manager"` 被更新检测过滤，导致顶部更新按钮隐藏、检查更新误显示「已是最新版本」且无法单独升级 Core 的缺陷。
+  - 新增 Linux 独立内置 Core 提权原子替换路径（`pkexec` 校验并原子替换 `/opt/herdr2/herdr2-core` 后执行 `h2 server restart` 无中断热重启，保留所有运行中终端并同步已安装 Skill 与远程 SSH 主机），并支持 macOS 内置 Helper 独立升级。
+  - 每次检查更新前主动刷新实时 `server.status` 与磁盘二进制版本，统一规范版本号比对；启动连接或点击更新时若磁盘上的 `herdr2-core` 二进制已高于当前运行守护进程，自动无中断热重启切换，无需重复下载或提权。
+  - 当桌面端已是最新但由外部包管理器（如 Homebrew / Nix / mise）托管的 `herdr2-core` 仍有新版本时，检查更新弹窗与本机状态行明确提示 Core 可升级版本、升级命令与「AI 更新」入口，不再误报「已是最新版本」。
+
+---
+
+#### English
+
+**Bug Fixes**
+- **Fixed False "Already Up to Date" Locking Out `herdr2-core` Upgrades When `herdr2-app` Is Already Latest**:
+  - Fixed a critical bug on Linux `.deb` (`/opt/herdr2/herdr2-core`) and other root-owned bundled installs where `herdr2-core` reported `installed_by = "system package manager"` and was suppressed as soon as `herdr2-app` reached the latest version (`app.ready == null`), hiding the top-right Update button, falsely reporting "Already Up to Date", and blocking standalone Core upgrades.
+  - Added a standalone Linux elevated atomic swap path (`pkexec` + verified atomic replace of bundled `/opt/herdr2/herdr2-core` + zero-downtime `h2 server restart`, keeping all terminals alive and syncing installed skills and SSH remote hosts), plus safe standalone macOS bundled helper updates.
+  - Refreshed live `server.status` and on-disk core binary versions before update checks with normalized semver comparison, and automatically hot-restarted stale running `h2` daemons on startup or update when the on-disk binary is already newer (with no download or elevation prompt).
+  - Updated Settings and the Update modal so externally managed cores (Homebrew / Nix / mise) with a newer release never falsely show "Already Up to Date", instead displaying the available Core version, upgrade command, and AI Update option.
+
 ## v2.0.22
 
 #### 中文

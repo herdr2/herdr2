@@ -145,7 +145,33 @@ fn main() {
                 // One that can't serve this app gets the screen that fixes it, after
                 // hot-restarting a stale daemon if the binary on disk already satisfies us.
                 Ok(core) => match hc::check(&core.hello) {
-                    Ok(()) => Ok(core),
+                    Ok(()) => {
+                        let running_ver = core.hello.get("version").and_then(serde_json::Value::as_str).unwrap_or_default();
+                        let disk_newer = !running_ver.is_empty()
+                            && core_bin::version(&core_bin::path())
+                                .is_some_and(|disk_ver| update::newer_core_version(&disk_ver, running_ver));
+                        if disk_newer {
+                            tracing::info!(
+                                "core binary on disk is newer than running daemon ({running_ver}); hot-restarting h2 daemon"
+                            );
+                            drop(core);
+                            let _ = core_bin::restart();
+                            let _ = std::thread::Builder::new()
+                                .name("herdr2-skill-sync".into())
+                                .spawn(|| {
+                                    let _ = core_bin::sync_skills();
+                                });
+                            match hc::Core::connect() {
+                                Ok(restarted) => hc::check(&restarted.hello).map(|()| restarted).map_err(setup::Need::Fix),
+                                Err(e) => {
+                                    eprintln!("herdr2: {e:#}");
+                                    Err(setup::Need::connection(e))
+                                }
+                            }
+                        } else {
+                            Ok(core)
+                        }
+                    }
                     Err(hc::Mismatch::TooOld { .. } | hc::Mismatch::Missing(_))
                         if core_bin::version(&core_bin::path()).is_some_and(|v| hc::meets_core_min(&v)) =>
                     {

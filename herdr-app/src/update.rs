@@ -242,6 +242,8 @@ struct RemoteSyncSummary {
 }
 
 static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: None, ready: None, notes: None, updating: false, error: None });
+/// Cached `--version` of the active `core_bin::path()` binary on disk (refreshed off the UI thread).
+static CORE_DISK_VERSION: Mutex<Option<String>> = Mutex::new(None);
 static MACHINES: Mutex<Vec<RemoteMachineUpdateInfo>> = Mutex::new(Vec::new());
 static MACHINES_UPDATING: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
@@ -269,6 +271,120 @@ fn target_core_version() -> Option<String> {
 
 fn clean_core_version(v: &str) -> &str {
     strip_core_prefix(v).split_whitespace().next().unwrap_or("")
+}
+
+pub(crate) fn newer_core_version(a: &str, b: &str) -> bool {
+    let ca = clean_core_version(a);
+    let cb = clean_core_version(b);
+    !ca.is_empty() && !cb.is_empty() && newer(ca, cb)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreUpdateStrategy {
+    /// Standard user-writable core: run `h2 update --json`.
+    Direct,
+    /// Root-owned bundled core on Linux (e.g. `.deb` `/opt/herdr2/herdr2-core`):
+    /// download verified core binary, atomically swap via `pkexec`, and hot-restart the daemon.
+    ElevatedLinuxBundled,
+    /// macOS helper core bundled inside `Herdr2.app/Contents/Helpers/h2`.
+    MacosBundled,
+    /// Externally owned package manager (homebrew, nix, mise, or non-bundled unwritable system path).
+    ExternalManaged,
+}
+
+fn core_update_strategy_for(
+    core_info: &CoreInfo,
+    install_root: Option<&Path>,
+    active_core: &Path,
+    is_linux: bool,
+    is_macos: bool,
+) -> CoreUpdateStrategy {
+    let resolved = active_core.canonicalize().ok();
+    if is_macos
+        && let Some(p) = resolved.as_deref()
+        && install_root.is_some_and(|r| p.starts_with(r))
+        && p.ends_with("Contents/Helpers/h2")
+    {
+        return CoreUpdateStrategy::MacosBundled;
+    }
+    if core_info.managed.is_none() {
+        return CoreUpdateStrategy::Direct;
+    }
+    if is_linux
+        && core_info.managed.as_deref() == Some("system package manager")
+        && let Some(p) = resolved.as_deref()
+        && p.is_file()
+        && (install_root.is_some_and(|r| p.starts_with(r)) || p.starts_with("/opt/herdr2"))
+    {
+        return CoreUpdateStrategy::ElevatedLinuxBundled;
+    }
+    CoreUpdateStrategy::ExternalManaged
+}
+
+fn disk_core_newer_than_running(core_info: &CoreInfo, disk_ver: Option<&str>) -> Option<String> {
+    let disk = disk_ver.map(clean_core_version).filter(|s| !s.is_empty())?;
+    let running = core_info.version.as_deref().map(clean_core_version).unwrap_or("");
+    (!running.is_empty() && newer(disk, running)).then(|| disk.to_owned())
+}
+
+fn disk_core_covers_ready(core_info: &CoreInfo, disk_ver: Option<&str>) -> Option<String> {
+    disk_core_newer_than_running(core_info, disk_ver).filter(|disk| {
+        core_info
+            .ready
+            .as_deref()
+            .map(clean_core_version)
+            .filter(|r| !r.is_empty())
+            .is_none_or(|r| !newer(r, disk))
+    })
+}
+
+fn core_can_self_update_for(
+    core_info: &CoreInfo,
+    disk_ver: Option<&str>,
+    install_root: Option<&Path>,
+    active_core: &Path,
+    is_linux: bool,
+    is_macos: bool,
+) -> (bool, bool) {
+    if disk_core_covers_ready(core_info, disk_ver).is_some() {
+        return (true, false);
+    }
+    match core_update_strategy_for(core_info, install_root, active_core, is_linux, is_macos) {
+        CoreUpdateStrategy::Direct => (true, false),
+        CoreUpdateStrategy::ElevatedLinuxBundled => (true, true),
+        CoreUpdateStrategy::MacosBundled => (core_info.managed.is_none(), false),
+        CoreUpdateStrategy::ExternalManaged => (false, false),
+    }
+}
+
+fn cached_disk_core_version() -> Option<String> {
+    CORE_DISK_VERSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+fn refresh_disk_core_version() -> Option<String> {
+    let ver = crate::core_bin::version(&crate::core_bin::path())
+        .map(|v| clean_core_version(&v).to_owned())
+        .filter(|v| !v.is_empty());
+    *CORE_DISK_VERSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ver.clone();
+    ver
+}
+
+fn core_self_update_capabilities(core_info: &CoreInfo) -> (bool, bool) {
+    let install_root = root();
+    let active_core = crate::core_bin::path();
+    let disk_ver = cached_disk_core_version();
+    core_can_self_update_for(
+        core_info,
+        disk_ver.as_deref(),
+        install_root.as_deref(),
+        &active_core,
+        cfg!(target_os = "linux"),
+        cfg!(target_os = "macos"),
+    )
+}
+
+pub fn core_can_update() -> bool {
+    core_self_update_capabilities(&core()).0
 }
 
 fn classify_remote_machine(
@@ -368,15 +484,20 @@ pub fn refresh_machines() {
 
 /// What the connected core says about itself (on connect and every reconnect).
 pub fn set_core(version: Option<String>, managed: Option<String>) {
+    let cleaned = version
+        .as_deref()
+        .map(clean_core_version)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let (Some(have), Some(ready)) = (&version, &c.ready)
+    if let (Some(have), Some(ready)) = (&cleaned, &c.ready)
         && !newer(ready, have)
     {
         c.ready = None;
     }
-    c.version = version;
+    c.version = cleaned;
     c.managed = managed;
-    if c.managed.is_some() {
+    if !core_self_update_capabilities(&c).0 {
         c.error = None;
     }
     drop(c);
@@ -384,6 +505,7 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
     #[cfg(not(test))]
     if !MACHINES_INIT_REFRESH.swap(true, Ordering::SeqCst) {
         let _ = std::thread::Builder::new().name("herdr2-machines-init".into()).spawn(|| {
+            refresh_disk_core_version();
             refresh_machines();
             crate::mods::request(crate::mods::Request::Refresh);
         });
@@ -438,6 +560,7 @@ pub fn status() -> serde_json::Value {
     let app_error = APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let ui = crate::ui_update::info();
     let core_info = core();
+    let (core_can_update, core_needs_elev) = core_self_update_capabilities(&core_info);
     let machines_snapshot = machines();
     let machines_updating = MACHINES_UPDATING.load(Ordering::Relaxed) || machines_snapshot.iter().any(|m| m.updating);
     let updating = UPDATING.load(Ordering::Relaxed) || app_updating || ui.applying || core_info.updating || machines_updating;
@@ -464,7 +587,7 @@ pub fn status() -> serde_json::Value {
             "notes": ui.ready_notes,
         }));
     }
-    if (core_info.managed.is_none() || core_updates_with_app) && let Some(ver) = &core_info.ready {
+    if (core_can_update || core_updates_with_app) && let Some(ver) = &core_info.ready {
         items.push(serde_json::json!({
             "kind": "core",
             "current": core_info.version,
@@ -501,14 +624,16 @@ pub fn status() -> serde_json::Value {
             "version": ver,
             "notes": ui.ready_notes,
             "restart": false,
+            "needs_elevation": core_can_update && core_info.ready.is_some() && core_needs_elev,
             "items": items,
         }))
-    } else if core_info.managed.is_none() && let Some(ver) = &core_info.ready {
+    } else if core_can_update && let Some(ver) = &core_info.ready {
         Some(serde_json::json!({
             "kind": "core",
             "version": ver,
             "notes": core_info.notes,
             "restart": false,
+            "needs_elevation": core_needs_elev,
             "items": items,
         }))
     } else if let Some(ver) = &remote_ready_ver {
@@ -523,6 +648,12 @@ pub fn status() -> serde_json::Value {
         None
     };
 
+    let mut core_json = serde_json::to_value(&core_info).unwrap_or_default();
+    if let Some(obj) = core_json.as_object_mut() {
+        obj.insert("can_update".into(), serde_json::Value::Bool(core_can_update));
+        obj.insert("needs_elevation".into(), serde_json::Value::Bool(core_needs_elev));
+    }
+
     serde_json::json!({
         "app": {
             "version": env!("CARGO_PKG_VERSION"),
@@ -535,7 +666,7 @@ pub fn status() -> serde_json::Value {
             "needs_elevation": app_needs_elevation,
         },
         "ui": ui,
-        "core": core_info,
+        "core": core_json,
         "machines": machines_snapshot,
         "updating": updating,
         "available": available,
@@ -716,15 +847,50 @@ fn check_core() -> Result<(), String> {
     check_core_from(&base_url)
 }
 
+fn refresh_core_state_from_live() {
+    if let Some(live) = crate::mods::live_core()
+        && let Ok(s) = live.call_timeout("server.status", serde_json::json!({}), Duration::from_secs(3))
+    {
+        let text = |k: &str| s.get(k).and_then(serde_json::Value::as_str).map(str::to_owned);
+        set_core(text("version"), text("installed_by"));
+    }
+    let disk_ver = refresh_disk_core_version();
+    if let Some(disk) = disk_ver {
+        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if c.version.is_none() {
+            c.version = Some(disk);
+        }
+    }
+}
+
 fn check_core_from(base_url: &str) -> Result<(), String> {
+    refresh_core_state_from_live();
     let have = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).version.clone();
     let Some(have) = have else { return Ok(()) };
-    let latest = latest_core_from(base_url)?;
+    let have_clean = clean_core_version(&have);
+    let disk_ver = cached_disk_core_version();
+    let latest = match latest_core_from(base_url) {
+        Ok(latest) => latest,
+        Err(e) => {
+            if let Some(disk) = disk_ver.as_deref().filter(|d| !have_clean.is_empty() && newer(d, have_clean)) {
+                let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                c.ready = Some(disk.to_owned());
+                c.notes = None;
+                drop(c);
+                reclassify_machines();
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
     let same = latest.generation == Some(crate::hc::GENERATION);
     let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if same && newer(&latest.version, &have) {
+    if same && newer(&latest.version, have_clean) {
         c.ready = Some(latest.version);
         c.notes = latest.notes;
+    } else if let Some(disk) = disk_ver.as_deref().filter(|d| !have_clean.is_empty() && newer(d, have_clean)) {
+        c.ready = Some(disk.to_owned());
+        c.notes = None;
     } else {
         c.ready = None;
         c.notes = None;
@@ -944,17 +1110,128 @@ fn sync_installed_skills_best_effort() -> Option<crate::core_bin::SkillSyncSumma
     }
 }
 
-fn run_core_update_blocking() {
-    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if c.managed.is_some() || c.updating {
-        return;
+#[cfg(unix)]
+fn update_elevated_linux_core_blocking() -> Result<String, String> {
+    let base_url = releases().ok_or_else(|| "automatic core updates require releases_url".to_owned())?;
+    let active = crate::core_bin::path()
+        .canonicalize()
+        .map_err(|e| format!("cannot locate active herdr2-core binary: {e}"))?;
+    let current_ver = crate::core_bin::version(&active)
+        .map(|v| clean_core_version(&v).to_owned())
+        .filter(|v| !v.is_empty())
+        .or_else(|| core().version);
+    let work = TempWorkDir::new("herdr2-core-update")?;
+    let Some((new_bin, new_ver)) = download_verified_core(&base_url, work.path(), current_ver.as_deref())? else {
+        // Binary on disk already matches or exceeds latest release; restart the running daemon.
+        crate::core_bin::restart()?;
+        return Ok(current_ver.unwrap_or_else(|| "the latest".into()));
+    };
+    let mut targets = vec![active.clone()];
+    if let Some(dir) = active.parent() {
+        for sibling_name in ["herdr2-core", "h2"] {
+            let sibling = dir.join(sibling_name);
+            if sibling != active
+                && sibling.symlink_metadata().is_ok_and(|m| m.file_type().is_file())
+            {
+                targets.push(sibling);
+            }
+        }
     }
-    c.updating = true;
-    c.error = None;
-    drop(c);
+    run_elevated_core_swap_with(
+        Path::new("pkexec"),
+        &["--disable-internal-agent"],
+        work.path(),
+        &new_bin,
+        &targets,
+        &new_ver,
+    )?;
+    crate::core_bin::restart()?;
+    Ok(new_ver)
+}
+
+#[cfg(not(unix))]
+fn update_elevated_linux_core_blocking() -> Result<String, String> {
+    Err("elevated core update is only supported on Linux".into())
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_bundled_core_blocking() -> Result<String, String> {
+    let base_url = releases().ok_or_else(|| "automatic core updates require releases_url".to_owned())?;
+    let install_root = root().ok_or_else(|| "cannot locate Herdr2.app bundle".to_owned())?;
+    let helper = install_root.join("Contents/Helpers/h2");
+    if !helper.is_file() {
+        return crate::core_bin::update();
+    }
+    let signature = Command::new("/usr/bin/codesign")
+        .arg("-dvv")
+        .arg(&install_root)
+        .output()
+        .map_err(|e| format!("codesign: {e}"))?;
+    if release_signature(signature.status.success(), &String::from_utf8_lossy(&signature.stderr))? {
+        return Err(
+            "Herdr2.app is Developer ID signed; reinstall the latest macOS DMG or use AI Update to refresh its bundled h2 helper."
+                .into(),
+        );
+    }
+    let current_ver = crate::core_bin::version(&helper)
+        .map(|v| clean_core_version(&v).to_owned())
+        .filter(|v| !v.is_empty())
+        .or_else(|| core().version);
+    let work = TempWorkDir::new("herdr2-macos-core-update")?;
+    let Some((new_bin, new_ver)) = download_verified_core(&base_url, work.path(), current_ver.as_deref())? else {
+        crate::core_bin::restart()?;
+        return Ok(current_ver.unwrap_or_else(|| "the latest".into()));
+    };
+    let tmp = helper.with_file_name(format!(".h2.new.{}", std::process::id()));
+    copy_executable(&new_bin, &tmp)?;
+    if let Err(e) = std::fs::rename(&tmp, &helper) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot replace {}: {e}", helper.display()));
+    }
+    run(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(&helper))?;
+    run(Command::new("/usr/bin/codesign").args(["--force", "--deep", "--sign", "-"]).arg(&install_root))?;
+    crate::core_bin::restart()?;
+    Ok(new_ver)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_macos_bundled_core_blocking() -> Result<String, String> {
+    crate::core_bin::update()
+}
+
+fn run_core_update_blocking() {
+    let (snapshot, strategy) = {
+        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !core_self_update_capabilities(&c).0 || c.updating {
+            return;
+        }
+        let install_root = root();
+        let active_core = crate::core_bin::path();
+        let strategy = core_update_strategy_for(
+            &c,
+            install_root.as_deref(),
+            &active_core,
+            cfg!(target_os = "linux"),
+            cfg!(target_os = "macos"),
+        );
+        c.updating = true;
+        c.error = None;
+        (c.clone(), strategy)
+    };
     crate::mods::request(crate::mods::Request::Refresh);
 
-    let res = crate::core_bin::update();
+    let disk_ver = refresh_disk_core_version();
+    let res = if let Some(disk_ready) = disk_core_covers_ready(&snapshot, disk_ver.as_deref()) {
+        crate::core_bin::restart().map(|()| disk_ready)
+    } else {
+        match strategy {
+            CoreUpdateStrategy::Direct => crate::core_bin::update(),
+            CoreUpdateStrategy::ElevatedLinuxBundled => update_elevated_linux_core_blocking(),
+            CoreUpdateStrategy::MacosBundled => update_macos_bundled_core_blocking(),
+            CoreUpdateStrategy::ExternalManaged => Err("herdr2-core is managed by an external package manager".into()),
+        }
+    };
+    let _ = refresh_disk_core_version();
     let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     c.updating = false;
     match res {
@@ -994,7 +1271,7 @@ fn run_core_update_blocking() {
 pub fn update_core() {
     {
         let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if c.managed.is_some() || c.updating {
+        if !core_self_update_capabilities(&c).0 || c.updating {
             return;
         }
     }
@@ -1150,7 +1427,7 @@ fn run_start_update_blocking() {
     let had_ui_ready = crate::ui_update::ready().is_some();
     let had_core_ready = {
         let c = core();
-        c.managed.is_none() && c.ready.is_some()
+        core_self_update_capabilities(&c).0 && c.ready.is_some()
     };
 
     let mut app_refresh_err: Option<String> = None;
@@ -1230,7 +1507,7 @@ fn run_start_update_blocking() {
         crate::mods::request(crate::mods::Request::Refresh);
         let _ = run_ui_update_blocking(base_url.as_deref(), false);
         let c = core();
-        if c.managed.is_none() && c.ready.is_some() {
+        if core_self_update_capabilities(&c).0 && c.ready.is_some() {
             run_core_update_blocking();
         } else if has_pending_remote_updates() {
             let summary = sync_remote_machines_blocking(false);
@@ -1241,7 +1518,7 @@ fn run_start_update_blocking() {
 
     // 3. Local Core update (automatically syncs all SSH remotes afterward)
     let c = core();
-    if c.managed.is_none() && c.ready.is_some() {
+    if core_self_update_capabilities(&c).0 && c.ready.is_some() {
         run_core_update_blocking();
         return;
     }
@@ -1557,6 +1834,95 @@ impl TempWorkDir {
 impl Drop for TempWorkDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+const ELEVATED_CORE_SWAP_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+src="$1"
+shift
+if [ "$#" -lt 1 ]; then
+  echo "missing target core path" >&2
+  exit 1
+fi
+for dst in "$@"; do
+  if [ -z "$dst" ] || [ "$dst" = "/" ]; then
+    echo "refusing unsafe core path: $dst" >&2
+    exit 1
+  fi
+  tmp="${dst}.new.$$"
+  rm -f "$tmp"
+  cp "$src" "$tmp"
+  chown --reference="$dst" "$tmp" 2>/dev/null || chown 0:0 "$tmp"
+  chmod 755 "$tmp"
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    echo "staged core binary failed verification: $dst" >&2
+    exit 1
+  fi
+  mv -f "$tmp" "$dst"
+done
+"#;
+
+#[cfg(unix)]
+fn run_elevated_core_swap_with(
+    elevator: &Path,
+    extra_args: &[&str],
+    work: &Path,
+    new_bin: &Path,
+    targets: &[PathBuf],
+    version: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let first_target = targets.first().ok_or_else(|| "no core binary target to update".to_owned())?;
+    let script_path = work.join("apply-core-update.sh");
+    std::fs::write(&script_path, ELEVATED_CORE_SWAP_SCRIPT)
+        .map_err(|e| format!("{}: {e}", script_path.display()))?;
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", script_path.display()))?;
+
+    let mut cmd = Command::new(elevator);
+    cmd.args(extra_args)
+        .arg("/bin/sh")
+        .arg(&script_path)
+        .arg(new_bin);
+    for dst in targets {
+        cmd.arg(dst);
+    }
+    let out = cmd.stdin(Stdio::null()).output();
+
+    match out {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let code = output.status.code();
+            let stderr = decode_process_output(&output.stderr).trim().to_owned();
+            let detail = if stderr.is_empty() {
+                decode_process_output(&output.stdout).trim().to_owned()
+            } else {
+                stderr
+            };
+            match code {
+                Some(126) => Err("Administrator authentication was cancelled; core update aborted.".into()),
+                Some(127) => {
+                    let suffix = if detail.is_empty() { String::new() } else { format!(" ({detail})") };
+                    Err(format!(
+                        "Administrator privileges are required to update {}{suffix}. Install the new .deb with `sudo apt install ./herdr2_{version}_amd64.deb` or run `sudo h2 update`.",
+                        first_target.display()
+                    ))
+                }
+                _ => Err(if detail.is_empty() {
+                    format!("Elevated core update failed for {} (exit code {:?})", first_target.display(), code)
+                } else {
+                    format!("Elevated core update failed for {}: {detail}", first_target.display())
+                }),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Administrator privileges are required to update {}, but pkexec is not installed. Install the new .deb with `sudo apt install ./herdr2_{version}_amd64.deb` or run `sudo h2 update`.",
+            first_target.display()
+        )),
+        Err(e) => Err(format!("Cannot launch {}: {e}", elevator.display())),
     }
 }
 
@@ -3200,5 +3566,174 @@ mod tests {
 
         *READY.lock().unwrap() = None;
         *APP_AVAILABLE.lock().unwrap() = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_update_strategy_and_capabilities_allow_standalone_bundled_and_stale_daemon_updates() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-core-strategy").unwrap();
+        let root = work.path().join("opt/herdr2");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundled = root.join("herdr2-core");
+        std::fs::write(&bundled, "#!/bin/sh\necho h2 2.0.21\n").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sys_managed = CoreInfo {
+            version: Some("2.0.21".into()),
+            managed: Some("system package manager".into()),
+            ready: Some("2.0.22".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            core_update_strategy_for(&sys_managed, Some(&root), &bundled, true, false),
+            CoreUpdateStrategy::ElevatedLinuxBundled
+        );
+        assert_eq!(
+            core_can_self_update_for(&sys_managed, Some("2.0.21"), Some(&root), &bundled, true, false),
+            (true, true)
+        );
+
+        // If the binary on disk is already 2.0.22 (only the running daemon is stale at 2.0.21),
+        // updating only needs `h2 server restart` — no elevation needed, even for package-managed cores.
+        assert_eq!(
+            core_can_self_update_for(&sys_managed, Some("2.0.22"), Some(&root), &bundled, true, false),
+            (true, false)
+        );
+        let brew_managed = CoreInfo {
+            version: Some("2.0.21".into()),
+            managed: Some("homebrew".into()),
+            ready: Some("2.0.22".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            core_update_strategy_for(&brew_managed, Some(&root), Path::new("/nonexistent/h2"), true, false),
+            CoreUpdateStrategy::ExternalManaged
+        );
+        assert_eq!(
+            core_can_self_update_for(&brew_managed, Some("2.0.21"), Some(&root), Path::new("/nonexistent/h2"), true, false),
+            (false, false)
+        );
+        assert_eq!(
+            core_can_self_update_for(&brew_managed, Some("2.0.22"), Some(&root), Path::new("/nonexistent/h2"), true, false),
+            (true, false)
+        );
+
+        // Non-bundled /nonexistent system-managed core remains ExternalManaged.
+        assert_eq!(
+            core_can_self_update_for(&sys_managed, None, Some(&root), Path::new("/nonexistent/herdr-core"), true, false),
+            (false, false)
+        );
+
+        // Unmanaged user-writable core uses Direct strategy.
+        let unmanaged = CoreInfo {
+            version: Some("2.0.21".into()),
+            managed: None,
+            ready: Some("2.0.22".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            core_update_strategy_for(&unmanaged, Some(&root), &bundled, true, false),
+            CoreUpdateStrategy::Direct
+        );
+        assert_eq!(
+            core_can_self_update_for(&unmanaged, Some("2.0.21"), Some(&root), &bundled, true, false),
+            (true, false)
+        );
+
+        // newer_core_version strips `h2 ` prefixes and build metadata suffixes safely.
+        assert!(newer_core_version("h2 2.0.22", "2.0.21 (a1b2c3d 2026-11-27T08:00:00Z)"));
+        assert!(!newer_core_version("h2 2.0.22", "2.0.22 (a1b2c3d 2026-11-27T08:00:00Z)"));
+        assert!(!newer_core_version("h2 2.0.21", "2.0.22"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elevated_core_swap_replaces_bundled_core_atomically_and_maps_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-elev-core-swap").unwrap();
+        let opt_dir = work.path().join("opt/herdr2");
+        std::fs::create_dir_all(&opt_dir).unwrap();
+        let target_core = opt_dir.join("herdr2-core");
+        let target_h2 = opt_dir.join("h2");
+        std::fs::write(&target_core, "#!/bin/sh\necho h2 2.0.21\n").unwrap();
+        std::fs::write(&target_h2, "#!/bin/sh\necho h2 2.0.21\n").unwrap();
+        std::fs::set_permissions(&target_core, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&target_h2, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let new_bin = work.path().join("new-core");
+        std::fs::write(&new_bin, "#!/bin/sh\necho h2 2.0.22\n").unwrap();
+        std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_elevated_core_swap_with(
+            Path::new("/usr/bin/env"),
+            &[],
+            work.path(),
+            &new_bin,
+            &[target_core.clone(), target_h2.clone()],
+            "2.0.22",
+        )
+        .unwrap();
+        assert_eq!(crate::core_bin::version(&target_core).as_deref(), Some("h2 2.0.22"));
+        assert_eq!(crate::core_bin::version(&target_h2).as_deref(), Some("h2 2.0.22"));
+
+        let mk_stub = |name: &str, body: &str| {
+            let p = work.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let cancelled = mk_stub("core-stub-126", "exit 126");
+        let err = run_elevated_core_swap_with(&cancelled, &[], work.path(), &new_bin, std::slice::from_ref(&target_core), "2.0.22").unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+
+        let unauth = mk_stub("core-stub-127", "echo 'No auth agent' >&2; exit 127");
+        let err = run_elevated_core_swap_with(&unauth, &[], work.path(), &new_bin, std::slice::from_ref(&target_core), "2.0.22").unwrap_err();
+        assert!(err.contains("No auth agent") && err.contains("herdr2_2.0.22_amd64.deb"), "{err}");
+
+        let missing = work.path().join("no-such-pkexec");
+        let err = run_elevated_core_swap_with(&missing, &[], work.path(), &new_bin, std::slice::from_ref(&target_core), "2.0.22").unwrap_err();
+        assert!(err.contains("pkexec is not installed"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_advertises_core_update_when_app_is_latest_and_disk_binary_is_newer_than_running() {
+        const CHILD: &str = "HERDR_TEST_STALE_RUNNING_CORE_STATUS";
+        if std::env::var_os(CHILD).is_none() {
+            let root = std::env::temp_dir().join(format!("herdr-stale-core-status-{}", std::process::id()));
+            std::fs::create_dir_all(root.join("core")).unwrap();
+            std::fs::write(root.join("core/latest.json"), r#"{"version":"2.0.22","generation":1}"#).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "update::tests::status_advertises_core_update_when_app_is_latest_and_disk_binary_is_newer_than_running", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HERDR2_RELEASES_URL", format!("file://{}", root.display()))
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(root);
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-stale-core").unwrap();
+        let disk_core = work.path().join("herdr2-core");
+        std::fs::write(&disk_core, "#!/bin/sh\necho h2 2.0.22\n").unwrap();
+        std::fs::set_permissions(&disk_core, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::core_bin::use_core(disk_core);
+
+        set_core(Some("2.0.21".into()), Some("system package manager".into()));
+        check_core().unwrap();
+
+        let st = status();
+        assert_eq!(st["app"]["ready"], serde_json::Value::Null);
+        assert_eq!(st["core"]["ready"], "2.0.22");
+        assert_eq!(st["core"]["can_update"], true);
+        assert_eq!(st["core"]["needs_elevation"], false);
+        assert_eq!(st["available"]["kind"], "core");
+        assert_eq!(st["available"]["version"], "2.0.22");
+        assert_eq!(st["available"]["needs_elevation"], false);
+        assert_eq!(st["available"]["items"][0]["kind"], "core");
+        assert_eq!(st["available"]["items"][0]["current"], "2.0.21");
+        assert_eq!(st["available"]["items"][0]["next"], "2.0.22");
     }
 }

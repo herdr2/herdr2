@@ -10163,13 +10163,14 @@ export default class Settings extends View {
     const app = u?.app ?? {};
     const ui = u?.ui ?? {};
     const core = u?.core ?? {};
+    const coreCanUpdate = Boolean(core.ready && (core.can_update ?? !core.managed));
     const avail = u?.available ?? null;
     const items = Array.isArray(avail?.items) ? avail.items : [];
     const fallbackItems = [];
     if (items.length === 0) {
       if (app.ready) fallbackItems.push({ kind: "app", current: app.version, next: app.ready, notes: app.notes });
       else if (ui.ready) fallbackItems.push({ kind: "ui", current: ui.version, next: ui.ready, notes: ui.ready_notes });
-      if (core.ready && !core.managed) fallbackItems.push({ kind: "core", current: core.version, next: core.ready, notes: core.notes });
+      if (coreCanUpdate) fallbackItems.push({ kind: "core", current: core.version, next: core.ready, notes: core.notes });
       for (const m of this.updateRemoteMachines(u)) {
         if (m.ready || m.rawState === "needs_update") {
           fallbackItems.push({
@@ -10192,7 +10193,9 @@ export default class Settings extends View {
         version: nextVersion ?? (core.ready || core.version || app.version || ""),
         notes: avail?.notes ?? list[0]?.notes ?? null,
         restart: Boolean(avail?.restart ?? Boolean(app.ready)),
-        needsElevation: Boolean(avail?.needs_elevation ?? app.needs_elevation),
+        needsElevation: Boolean(
+          avail?.needs_elevation ?? (app.ready ? app.needs_elevation : coreCanUpdate ? core.needs_elevation : false),
+        ),
         items: list,
       };
     }
@@ -10201,6 +10204,15 @@ export default class Settings extends View {
         kind: "error",
         message: String(u.last_error),
         missingUrl: !u?.releases_url,
+      };
+    }
+    if (core.ready) {
+      return {
+        kind: "managed_core_update",
+        version: core.ready,
+        current: core.version ?? "",
+        managed: core.managed ?? "package manager",
+        appVersion: app.version ?? "",
       };
     }
     return {
@@ -10273,6 +10285,26 @@ export default class Settings extends View {
               "点击更新后将在后台自动免重启生效，并同步更新已安装的 Skill 与所有 SSH 远程主机的 herdr2-core，不会中断现有终端会话。",
             ),
       );
+    } else if (m.kind === "managed_core_update") {
+      title = this.tr("Core Update Available", "发现 Core 新版本");
+      badge = m.version ? `v${String(m.version).replace(/^v/i, "")}` : null;
+      const from = m.current ? `${fmtVer(m.current)} → ` : "";
+      const to = m.version ? fmtVer(m.version) : "";
+      lines.push(`herdr2-core：${from}${to}`);
+      const mgr = String(m.managed ?? "package manager");
+      const cmdHint = mgr === "homebrew"
+        ? "brew upgrade herdr2"
+        : mgr === "mise"
+          ? "mise upgrade herdr2"
+          : mgr === "nix"
+            ? this.tr("update herdr2 in your Nix configuration", "在 Nix 配置中升级 herdr2")
+            : this.tr("update via your system package manager or reinstall the latest package", "请通过系统包管理器升级，或重新安装最新安装包");
+      lines.push(
+        this.tr(
+          `Herdr2${m.appVersion ? ` (${fmtVer(m.appVersion)})` : ""} is up to date, but herdr2-core is managed by ${mgr}. Upgrade it via: ${cmdHint}. You can also use AI Update below.`,
+          `Herdr2 桌面端${m.appVersion ? `（${fmtVer(m.appVersion)}）` : ""}已是最新版，但 herdr2-core 当前由 ${mgr} 托管。请执行升级：${cmdHint}，或点击下方「AI 更新」协助处理。`,
+        ),
+      );
     } else if (m.kind === "error") {
       title = this.tr("Update Check Failed", "检查更新失败");
       lines.push(
@@ -10332,6 +10364,27 @@ export default class Settings extends View {
               c.notify();
             })
             .child(this.tr("Update Now", "立即更新")),
+        );
+    } else if (m.kind === "managed_core_update") {
+      actions
+        .child(this.button(t, "st-update-modal-ok", this.tr("Close", "关闭"), closeModal))
+        .child(
+          div()
+            .id("st-update-modal-ai")
+            .px(14)
+            .py(6)
+            .rounded(7)
+            .cursor_pointer()
+            .bg(t.accent)
+            .text_color(t.accent_foreground)
+            .text_size(13)
+            .font_semibold()
+            .hover((s) => s.opacity(0.9))
+            .on_click((_e, c) => {
+              c.stop_propagation();
+              this.openAiUpdatePanel(c, null);
+            })
+            .child(this.tr("✨ AI Update", "✨ AI 更新")),
         );
     } else if (m.kind === "error") {
       actions
@@ -10492,7 +10545,8 @@ export default class Settings extends View {
             .on_click((_e, c) => this.triggerUpdateCheck(c))
             .child(this.tr("Check for Updates", "检查更新"));
 
-    const updateErr = u.app?.error || u.ui?.error || (!c.managed ? c.error : null) || u.last_error;
+    const coreCanUpdate = Boolean(c.ready && (c.can_update ?? !c.managed));
+    const updateErr = u.app?.error || u.ui?.error || ((c.can_update ?? !c.managed) ? c.error : null) || u.last_error;
     const aiPanelOpen = Boolean(this.aiUpdateOpen);
 
     const aiUpdateBtn = h_flex()
@@ -10817,14 +10871,14 @@ export default class Settings extends View {
         .text_color(color)
         .child(label);
 
-    const localNeedsUpdate = Boolean(u.app?.ready || u.ui?.ready || (c.ready && !c.managed));
+    const localNeedsUpdate = Boolean(u.app?.ready || u.ui?.ready || c.ready);
     const localUpdating = Boolean(u.app?.updating || u.ui?.applying || c.updating);
     const localDetailParts = [
       u.app?.version
         ? `Herdr2 ${fmtVer(u.app.version)}${u.app.ready ? ` → ${fmtVer(u.app.ready)}` : ""}`
         : null,
       c.version
-        ? `herdr2-core ${fmtVer(c.version)}${c.ready && !c.managed ? ` → ${fmtVer(c.ready)}` : ""}${c.managed ? ` (${c.managed})` : ""}`
+        ? `herdr2-core ${fmtVer(c.version)}${c.ready ? ` → ${fmtVer(c.ready)}` : ""}${c.managed && !coreCanUpdate ? ` (${c.managed})` : ""}`
         : `herdr2-core ${this.tr("unknown", "版本未知")}`,
     ].filter(Boolean).join(" · ");
 
