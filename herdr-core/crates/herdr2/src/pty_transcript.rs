@@ -199,7 +199,7 @@ fn explicit_cli_session_id_from_argv(argv: &[String], agent_hint: Option<&str>) 
     None
 }
 
-fn terminal_known_session_id(t: &Terminal, hint: Option<&str>) -> Option<String> {
+pub(crate) fn terminal_known_session_id(t: &Terminal, hint: Option<&str>) -> Option<String> {
     if let Some(fg) = &t.foreground
         && let Some(sid) = explicit_cli_session_id_from_argv(&fg.argv, hint)
     {
@@ -238,11 +238,8 @@ pub fn populate_session_affinity(
     }
     let is_agy = snap.agent_hint.as_deref() == Some("agy");
     let own_tc = core.target_checkpoints(st, target_addr);
-    if let Some(sid) = own_tc
-        .cli_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
+    if let Some(sid) =
+        own_tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
         && !acp_sids.contains(sid)
     {
         snap.pinned_session_id = Some(sid.to_string());
@@ -258,11 +255,8 @@ pub fn populate_session_affinity(
         if addr == target_addr {
             continue;
         }
-        if let Some(sid) = tc
-            .cli_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
+        if let Some(sid) =
+            tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
             && snap.pinned_session_id.as_deref() != Some(sid)
         {
             snap.excluded_session_ids.insert(sid.to_string());
@@ -316,11 +310,8 @@ fn extract_transcript_with_home(
     }
     let allow_older_fallback = snap.resumed || snap.turn > 0;
     let fg_started_ms = snap.fg_pid.and_then(proc_started_ms);
-    let effective_start = if snap.resumed {
-        0
-    } else {
-        fg_started_ms.map_or(snap.started_ms, |f| snap.started_ms.max(f))
-    };
+    let effective_start =
+        if snap.resumed { 0 } else { fg_started_ms.map_or(snap.started_ms, |f| snap.started_ms.max(f)) };
     let min_mtime = if snap.resumed { 0 } else { effective_start.saturating_sub(MTIME_SLACK_MS) };
     let providers = ordered_providers(snap.agent_hint.as_deref());
 
@@ -338,11 +329,9 @@ fn extract_transcript_with_home(
                 &norm_cwd,
                 if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
             ),
-            Provider::Cursor => discover_cursor(
-                home,
-                &norm_cwd,
-                if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
-            ),
+            Provider::Cursor => {
+                discover_cursor(home, &norm_cwd, if snap.pinned_session_id.is_some() { 0 } else { min_mtime })
+            }
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
             Provider::Agy => {
@@ -448,7 +437,7 @@ fn hint_from_label(raw: &str) -> Option<&'static str> {
     None
 }
 
-fn detect_agent_hint(t: &Terminal) -> Option<String> {
+pub(crate) fn detect_agent_hint(t: &Terminal) -> Option<String> {
     if let Some(fg) = &t.foreground {
         if let Some(h) = hint_from_words(std::iter::once(fg.name.as_str()).chain(fg.argv.iter().map(String::as_str))) {
             return Some(h.to_string());
@@ -563,7 +552,7 @@ pub(crate) fn normalize_cwd(raw: &str) -> String {
     if stripped.is_empty() { "/".to_string() } else { stripped.to_string() }
 }
 
-fn cwd_matches(a: &str, b: &str) -> bool {
+pub(crate) fn cwd_matches(a: &str, b: &str) -> bool {
     let na = normalize_cwd(a);
     let nb = normalize_cwd(b);
     if na.is_empty() || nb.is_empty() {
@@ -579,7 +568,7 @@ fn cwd_matches(a: &str, b: &str) -> bool {
     }
 }
 
-fn mtime_ms(path: &Path) -> u64 {
+pub(crate) fn mtime_ms(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -587,7 +576,7 @@ fn mtime_ms(path: &Path) -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn created_ms(path: &Path) -> u64 {
+pub(crate) fn created_ms(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|m| m.created())
         .ok()
@@ -615,11 +604,8 @@ fn pick_best_candidate(
     if candidates.is_empty() {
         return None;
     }
-    let effective_start = if allow_older_fallback {
-        started_ms
-    } else {
-        fg_started_ms.map_or(started_ms, |f| started_ms.max(f))
-    };
+    let effective_start =
+        if allow_older_fallback { started_ms } else { fg_started_ms.map_or(started_ms, |f| started_ms.max(f)) };
     let start_floor = effective_start.saturating_sub(START_SLACK_MS);
     let fg_floor = fg_started_ms.map(|ms| ms.saturating_sub(START_SLACK_MS));
     let mut after_start: Vec<Candidate> = Vec::new();
@@ -654,11 +640,11 @@ fn pick_best_candidate(
     }
 }
 
-fn claude_slug(cwd: &str) -> String {
+pub(crate) fn claude_slug(cwd: &str) -> String {
     cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
-fn claude_root(home: &Path, override_dir: Option<&Path>) -> PathBuf {
+pub(crate) fn claude_root(home: &Path, override_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir.to_path_buf();
     }
@@ -765,7 +751,7 @@ fn inspect_claude_header(path: &Path) -> (Option<String>, u64) {
     (found_cwd, first_ts)
 }
 
-fn codex_root(home: &Path, override_dir: Option<&Path>) -> PathBuf {
+pub(crate) fn codex_root(home: &Path, override_dir: Option<&Path>) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir.to_path_buf();
     }
@@ -828,7 +814,7 @@ fn discover_codex(home: &Path, override_dir: Option<&Path>, cwd: &str, min_mtime
     out
 }
 
-fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn sorted_subdirs_desc(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1021,7 +1007,7 @@ fn inspect_pi_header(path: &Path, cwd: &str) -> Option<u64> {
     Some(ts)
 }
 
-fn pick_agy_log_file(logs_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn pick_agy_log_file(logs_dir: &Path) -> Option<PathBuf> {
     let full = logs_dir.join("transcript_full.jsonl");
     if full.is_file() && fs::metadata(&full).is_ok_and(|m| m.len() > 0) {
         return Some(full);
@@ -1112,11 +1098,7 @@ pub(crate) fn probe_agy_proc(fg_pid: u32) -> ProcAgyProbe {
             }
         }
     }
-    if proc_looks_like_agy(fg_pid) || child_is_agy {
-        ProcAgyProbe::IdleNoLock
-    } else {
-        ProcAgyProbe::Unavailable
-    }
+    if proc_looks_like_agy(fg_pid) || child_is_agy { ProcAgyProbe::IdleNoLock } else { ProcAgyProbe::Unavailable }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1272,7 +1254,7 @@ fn claude_tool_detail(name: &str, input: &Value) -> Option<String> {
     }
 }
 
-fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let settings = load_claude_settings();
     parse_claude_jsonl_with_settings(path, settings.as_ref())
 }
@@ -1768,7 +1750,7 @@ fn is_claude_command_noise(s: &str) -> bool {
         || s.contains("<local-command-stderr>")
 }
 
-fn strip_system_reminders(raw: &str) -> String {
+pub(crate) fn strip_system_reminders(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(start) = rest.find("<system-reminder>") {
@@ -1848,7 +1830,7 @@ fn codex_tool_detail(name: &str, args: &Value) -> Option<String> {
     }
 }
 
-fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut parsed: Vec<Value> = Vec::new();
     let mut has_event_user_msg = false;
@@ -2158,7 +2140,7 @@ fn codex_output_failed(output: Option<&Value>) -> bool {
     false
 }
 
-fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let mut meta = ReadSessionMeta::default();
     let Ok(raw) = fs::read_to_string(path) else {
         return (Vec::new(), meta);
@@ -2366,7 +2348,7 @@ fn summarize_generic_tool(name: &str, args: &Value) -> (Option<String>, String) 
     }
 }
 
-fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries = Vec::new();
     let mut meta = ReadSessionMeta::default();
@@ -2502,7 +2484,7 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     (entries, meta)
 }
 
-fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries = Vec::new();
     let mut meta = ReadSessionMeta::default();
@@ -2623,7 +2605,7 @@ fn strip_xml_tag_blocks(raw: &str, tag: &str) -> String {
     out
 }
 
-fn strip_user_request_wrapper(raw: &str) -> String {
+pub(crate) fn strip_user_request_wrapper(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with("[plan review]") {
         return String::new();
@@ -2800,7 +2782,7 @@ pub(crate) fn parse_cli_transcript(kind: &str, path: &Path) -> Vec<Entry> {
     }
 }
 
-fn cursor_project_slug(cwd: &str) -> String {
+pub(crate) fn cursor_project_slug(cwd: &str) -> String {
     let mut out = String::with_capacity(cwd.len());
     let mut prev_dash = true;
     for ch in cwd.chars() {
@@ -2832,16 +2814,9 @@ fn discover_cursor(home: &Path, cwd: &str, min_mtime: u64) -> Vec<Candidate> {
         Some(direct_dir)
     } else {
         // On Windows, drive letter casing can differ (`d-Users-...` vs `D-Users-...`).
-        fs::read_dir(&projects_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                p.is_dir()
-                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&slug))
-            })
+        fs::read_dir(&projects_dir).ok().into_iter().flatten().flatten().map(|e| e.path()).find(|p| {
+            p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&slug))
+        })
     };
     let Some(slug_dir) = slug_dir else {
         return Vec::new();
@@ -2916,9 +2891,9 @@ fn extract_cursor_message_ts_ms(v: &Value) -> Option<u64> {
     let content = v.pointer("/message/content")?;
     match content {
         Value::String(s) => parse_cursor_timestamp_tag(s),
-        Value::Array(blocks) => blocks.iter().find_map(|b| {
-            b.get("text").and_then(Value::as_str).and_then(parse_cursor_timestamp_tag)
-        }),
+        Value::Array(blocks) => {
+            blocks.iter().find_map(|b| b.get("text").and_then(Value::as_str).and_then(parse_cursor_timestamp_tag))
+        }
         _ => None,
     }
 }
@@ -3009,7 +2984,7 @@ fn parse_cursor_human_ts(raw: &str) -> Option<u64> {
     (secs >= 0).then_some((secs as u64) * 1000)
 }
 
-fn clean_cursor_user_text(raw: &str) -> String {
+pub(crate) fn clean_cursor_user_text(raw: &str) -> String {
     let mut s = raw.to_string();
     while let Some(start) = s.find("<timestamp>") {
         let after_start = start + "<timestamp>".len();
@@ -3091,11 +3066,7 @@ fn summarize_cursor_tool(name: &str, input: &Value) -> (Option<String>, String) 
 fn cursor_tool_detail(name: &str, input: &Value) -> Option<String> {
     match name {
         "StrReplace" | "Edit" | "EditFile" => {
-            let path = input
-                .get("path")
-                .or_else(|| input.get("file_path"))
-                .and_then(Value::as_str)
-                .unwrap_or("file");
+            let path = input.get("path").or_else(|| input.get("file_path")).and_then(Value::as_str).unwrap_or("file");
             let old_t = input.get("old_string").and_then(Value::as_str).unwrap_or("");
             let new_t = input.get("new_string").and_then(Value::as_str).unwrap_or("");
             if old_t.is_empty() && new_t.is_empty() {
@@ -3112,15 +3083,10 @@ fn cursor_tool_detail(name: &str, input: &Value) -> Option<String> {
             }
             cap_tool_detail(&diff)
         }
-        "Write" => input
-            .get("contents")
-            .or_else(|| input.get("content"))
-            .and_then(Value::as_str)
-            .and_then(cap_tool_detail),
-        "ApplyPatch" => input
-            .as_str()
-            .or_else(|| input.get("patch").and_then(Value::as_str))
-            .and_then(cap_tool_detail),
+        "Write" => {
+            input.get("contents").or_else(|| input.get("content")).and_then(Value::as_str).and_then(cap_tool_detail)
+        }
+        "ApplyPatch" => input.as_str().or_else(|| input.get("patch").and_then(Value::as_str)).and_then(cap_tool_detail),
         "Shell" | "Bash" | "RunCommand" => {
             let cmd = input.get("command").and_then(Value::as_str)?.trim();
             if cmd.contains('\n') || cmd.len() > 120 { cap_tool_detail(cmd) } else { None }
@@ -3139,7 +3105,7 @@ fn complete_open_tools(entries: &mut [Entry], open_tools: &mut Vec<usize>, new_s
     }
 }
 
-fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+pub(crate) fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries: Vec<Entry> = Vec::new();
     let mut meta = ReadSessionMeta::default();
@@ -3217,7 +3183,9 @@ fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             Some("assistant") => {
                 // Each subsequent assistant message implies tools from the prior message finished.
                 complete_open_tools(&mut entries, &mut open_tools, "completed");
-                if let Some(m) = v.pointer("/message/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(m) =
+                    v.pointer("/message/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                {
                     meta.model = Some(m.to_string());
                 }
                 let Some(content) = v.pointer("/message/content") else {
@@ -3239,10 +3207,8 @@ fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                         for block in blocks {
                             match block.get("type").and_then(Value::as_str) {
                                 Some("thinking") => {
-                                    if let Some(text) = block
-                                        .get("thinking")
-                                        .or_else(|| block.get("text"))
-                                        .and_then(Value::as_str)
+                                    if let Some(text) =
+                                        block.get("thinking").or_else(|| block.get("text")).and_then(Value::as_str)
                                     {
                                         let clean = text.trim();
                                         if !clean.is_empty() {
@@ -3314,11 +3280,7 @@ fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
 
     if !entries.is_empty() || !meta.is_empty() {
         if meta.session_id.is_none()
-            && let Some(stem) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::trim).filter(|s| !s.is_empty())
         {
             meta.session_id = Some(stem.to_string());
         }
@@ -3962,10 +3924,7 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let pinned_unwritten = PtySnapshot {
-            pinned_session_id: Some("brand-new-pinned-uuid".into()),
-            ..fresh
-        };
+        let pinned_unwritten = PtySnapshot { pinned_session_id: Some("brand-new-pinned-uuid".into()), ..fresh };
         assert!(
             extract_entries_with_home(&pinned_unwritten, &root, Some(&root), None).is_empty(),
             "missing pinned session must not fall back to another session"
@@ -4295,7 +4254,9 @@ mod tests {
             Entry::ToolCall { title, tool_kind, status, .. }
             if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "completed"
         ));
-        assert!(matches!(&entries[4], Entry::Assistant { turn: 1, text, .. } if text == "已将端口更新为 9090 并通过测试。"));
+        assert!(
+            matches!(&entries[4], Entry::Assistant { turn: 1, text, .. } if text == "已将端口更新为 9090 并通过测试。")
+        );
         fs::remove_dir_all(root).ok();
     }
 }

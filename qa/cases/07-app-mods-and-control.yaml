@@ -2,7 +2,7 @@ suite: 07-app-mods-and-control
 cases:
   - id: TC-APP-014
     feature: F16
-    title: 全量 25 Mods 与 3 Frames 静态加载校验 (herdr2 check across all 25 mods & 3 frames)
+    title: 全量 26 Mods 与 3 Frames 静态加载校验 (herdr2 check across all 26 mods & 3 frames)
     tier: L0-static
     mode: scripted
     priority: P0
@@ -11,12 +11,12 @@ cases:
       rpc: []
       cli: ["herdr2 check"]
       app_commands: [mod.open, overlay.close]
-      mods: [agents, changes, checkpoints, confirm, files, flash-note, handoff, help, machine-add, menu, new-menu, pane, peek, picker, polish-progress, prompt, spaces, tabs, terminals-bar, terminals-pane, toast, win98, workspace-chrome, workspace-status, worktree]
+      mods: [agents, changes, checkpoints, confirm, files, flash-note, handoff, help, machine-add, menu, new-menu, pane, peek, picker, polish-progress, prompt, sessions, spaces, tabs, terminals-bar, terminals-pane, toast, win98, workspace-chrome, workspace-status, worktree]
       frames: [palette, settings, welcome]
     preconditions:
       - "Built `herdr2` desktop binary and `herdr-app/defaults/{mods,frame}` present."
     steps:
-      - "Iterate over all 25 directories in `herdr-app/defaults/mods/` and 3 directories in `herdr-app/defaults/frame/`."
+      - "Iterate over all 26 directories in `herdr-app/defaults/mods/` and 3 directories in `herdr-app/defaults/frame/`."
       - "Run `herdr2 check <dir>` in isolated `HERDR2_APP_HOME` (verifying `shared.json` is left untouched)."
     oracles:
       - "Every single mod and frame passes `herdr2 check` with exit code 0 and zero QuickJS runtime/schema errors."
@@ -264,3 +264,28 @@ cases:
       - "`app.restart` and `app.update_core` keep Core `t1` alive seamlessly."
     ai_probe_hints:
       - "Verify release manifest signing/hash mismatch aborts update before replacing binaries."
+
+  - id: TC-APP-025
+    feature: F16
+    title: CLI Agent 会话面板历史浏览与右键复制 Full-Access 恢复命令 (sessions, tabs & menu mods)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [session.list, session.read]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [layout.select, layout.show, layout.hide, overlay.close]
+      mods: [sessions, tabs, menu]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with an active CLI agent tab (`claude` / `codex`) and historical workspace sessions."
+    steps:
+      - "Verify `[会话]` (`panel-sessions`) button appears immediately after `[文件][变更][快照]` on CLI agent tabs and hides on ACP / plain shell tabs."
+      - "Open `sessions` panel, select a historical session to inspect its user/assistant conversation turns, and right-click the session row to open the context `menu` (`tab: 'session'`)."
+      - "Choose `复制恢复对话命令（Full Access）` / `Copy resume command (full access)` and verify clipboard contents."
+    oracles:
+      - "`sessions` displays historical conversation content scoped to the current workspace and current CLI agent."
+      - "Right-click context menu copies the full-access resume command to clipboard and emits a confirmation toast."
+    ai_probe_hints:
+      - "Confirm `[会话]` stays accessible when a CLI agent exits back to shell (`saved_cli` retained) so the user can paste the resume command."

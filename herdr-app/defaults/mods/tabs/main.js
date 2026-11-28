@@ -71,12 +71,50 @@ function find(node, id) {
   return null;
 }
 
+function isCliAgentPaneOrTerm(pane, term) {
+  if (pane?.acp || term?.acp) return false;
+  return Boolean(
+    pane?.structured
+      || pane?.program?.agent
+      || term?.program?.agent
+      || term?.saved_cli?.kind
+      || pane?.app
+      || term?.report?.app,
+  );
+}
+
+function activeTabHasCliAgent(space) {
+  if (!space) return false;
+  const activeTab = (space.tabs ?? []).find((t) => t?.active);
+  if (!activeTab) return false;
+  const pList = typeof panes === "function" ? panes() : [];
+  const tList = typeof terminals === "function" ? terminals() : [];
+  const termByAddr = new Map();
+  if (Array.isArray(tList)) {
+    for (const rec of tList) {
+      if (rec?.address) termByAddr.set(rec.address, rec);
+    }
+  }
+  const tabPanes = Array.isArray(pList) ? pList.filter((p) => p?.tab === activeTab.id) : [];
+  if (tabPanes.length === 0) return false;
+  const focusedPane = tabPanes.find((p) => p.focused && p.terminal);
+  if (focusedPane) {
+    const fTerm = termByAddr.get(focusedPane.terminal) ?? null;
+    if (focusedPane.acp || fTerm?.acp) return false;
+    if (isCliAgentPaneOrTerm(focusedPane, fTerm)) return true;
+  }
+  return tabPanes.some((p) => p.terminal && isCliAgentPaneOrTerm(p, termByAddr.get(p.terminal) ?? null));
+}
+
 function resolveEnabledPanels(defaultIds) {
   const saved = shared("workspace.panels");
   if (!Array.isArray(saved)) return defaultIds;
   const out = [...saved];
   if (!shared("workspace.panels_has_checkpoints") && !out.includes("checkpoints")) {
     out.push("checkpoints");
+  }
+  if (!shared("workspace.panels_has_sessions") && !out.includes("sessions")) {
+    out.push("sessions");
   }
   if (!shared("workspace.panels_has_side_chat") && !out.includes("side-chat")) {
     out.push("side-chat");
@@ -238,6 +276,7 @@ export default class Tabs extends View {
     this.stripWidth = 0;
     this.equalTabWidth = null;
     this.seenTabsSpace = null;
+    this.sessionsAutoHidden = new Set();
     this.seenTabIds = new Set();
     this.drag = null;
     this.settling = null;
@@ -568,6 +607,26 @@ export default class Tabs extends View {
       if (this.pending.want !== now && Date.now() < this.pending.until) return;
       this.pending = null;
     }
+    if (!panel.hidden && body?.active === "sessions" && !enabled.includes("sessions")) {
+      this.sessionsAutoHidden.add(space.id);
+      this.pending = { want: null, until: Date.now() + 1000 };
+      run("layout.hide", { id: "panel" });
+      return;
+    }
+    if (panel.hidden && this.sessionsAutoHidden.has(space.id)) {
+      if (enabled.includes("sessions") && this.panels[space.id] === "sessions") {
+        this.sessionsAutoHidden.delete(space.id);
+        this.pending = { want: "sessions", until: Date.now() + 1000 };
+        run("layout.select", { stack: "panel-body", child: "sessions" });
+        run("layout.show", { id: "panel" });
+        return;
+      }
+      if (!enabled.includes("sessions")) return;
+      this.sessionsAutoHidden.delete(space.id);
+    }
+    if (!panel.hidden && body?.active && body.active !== "sessions") {
+      this.sessionsAutoHidden.delete(space.id);
+    }
     if (this.panels[space.id] === now) return;
     this.panels[space.id] = now;
     localStorage.setItem("panels", JSON.stringify(this.panels));
@@ -889,9 +948,12 @@ export default class Tabs extends View {
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
-    const enabled = resolveEnabledPanels(["files", "changes", "checkpoints", "side-chat"]);
+    const enabled = resolveEnabledPanels(["files", "changes", "checkpoints", "sessions", "side-chat"]);
+    const hasCliAgent = activeTabHasCliAgent(space);
     const hasSideChats = focusedMainSideChatCount() > 0;
-    const effectiveEnabled = hasSideChats ? enabled : enabled.filter((id) => id !== "side-chat");
+    const effectiveEnabled = enabled.filter(
+      (id) => (id !== "sessions" || hasCliAgent) && (id !== "side-chat" || hasSideChats),
+    );
     this.syncPanel(space, panel, body, effectiveEnabled);
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
@@ -1045,6 +1107,7 @@ export default class Tabs extends View {
       .when(enabled.includes("files"), el => el.child(panelButton("files", tr("Files", "文件"), "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))
+      .when(enabled.includes("sessions") && hasCliAgent, el => el.child(panelButton("sessions", tr("Sessions", "会话"), "mods/sessions/sessions.svg")))
       .when(enabled.includes("side-chat") && hasSideChats, el => el.child(panelButton("side-chat", tr("Side Chat", "旁路"), "mods/peek/messages-square.svg")))
       .when(Boolean(updateBtn), el => el.child(updateBtn))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))

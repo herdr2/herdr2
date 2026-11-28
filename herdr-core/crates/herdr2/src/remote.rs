@@ -1039,6 +1039,8 @@ const ON_A_TARGET: &[&str] = &[
     "checkpoint.diff",
     "checkpoint.rollback",
     "checkpoint.bisect",
+    "session.list",
+    "session.read",
 ];
 
 /// Where a call goes when it isn't here.
@@ -1100,7 +1102,10 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "ai.briefing"
             | "ai.commit_message"
             | "ai.polish_prompt"
-    ) && !(method == "ai.polish_prompt" && params["on"].is_null())
+            | "session.list"
+            | "session.read"
+    ) && !((method == "ai.polish_prompt" || method == "session.list" || method == "session.read")
+        && params["on"].is_null())
     {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));
@@ -1108,7 +1113,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             Some(To::Peer { name, .. }) => return Err(crate::machines::unknown(&st.machines, &name)),
             to => to,
         };
-        if method == "ai.polish_prompt"
+        if matches!(method, "ai.polish_prompt" | "session.list" | "session.read")
             && let Some(ref dest) = to
             && let Some((tgt_prefix, tgt_local)) =
                 params["target"].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))

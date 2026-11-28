@@ -2121,6 +2121,160 @@
         ],
         "type": "object"
       },
+      "CliSessionListResult": {
+        "properties": {
+          "active_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/CliSessionSummary"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cwd",
+          "agent",
+          "agent_name",
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "CliSessionReadResult": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "agent_name": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            },
+            "type": "array"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resume_command": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "turns": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "agent",
+          "agent_name",
+          "title",
+          "turns",
+          "updated_ms",
+          "resume_command",
+          "entries"
+        ],
+        "type": "object"
+      },
+      "CliSessionSummary": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "created_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "current": {
+            "default": false,
+            "type": "boolean"
+          },
+          "git_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resume_command": {
+            "description": "Ready-to-run CLI command that resumes this session with full-access permissions.",
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "turns": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "agent",
+          "title",
+          "turns",
+          "created_ms",
+          "updated_ms",
+          "resume_command"
+        ],
+        "type": "object"
+      },
       "CommitMessageResult": {
         "properties": {
           "fromCache": {
@@ -6328,7 +6482,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.26"
+    "version": "2.0.27"
   },
   "methods": [
     {
@@ -13440,6 +13594,211 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CheckpointHookResult"
+        }
+      }
+    },
+    {
+      "description": "List historical CLI agent sessions for a workspace and CLI agent, including full-access resume commands.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "session.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, `qwen`, `gemini`, `pi`, `omp`, `hermes`, ...).",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, `qwen`, `gemini`, `pi`, `omp`, `hermes`, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Workspace folder path (overrides `target`'s cwd when given).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Workspace folder path (overrides `target`'s cwd when given).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Maximum sessions to return (default 60, max 200).",
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "Maximum sessions to return (default 60, max 200).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional terminal (`t1` or `machine/t1`) used to infer workspace folder, CLI agent, and active session ID.",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "Optional terminal (`t1` or `machine/t1`) used to infer workspace folder, CLI agent, and active session ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CliSessionListResult"
+        }
+      }
+    },
+    {
+      "description": "Read structured conversation entries of a historical CLI agent session.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "session.read",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, ...).",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Workspace folder path hint.",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Workspace folder path hint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Maximum structured entries to return (default 500, max 2000).",
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "Maximum structured entries to return (default 500, max 2000).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Historical session ID to read.",
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "description": "Historical session ID to read.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional terminal (`t1` or `machine/t1`) used to infer CLI agent or workspace folder.",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "Optional terminal (`t1` or `machine/t1`) used to infer CLI agent or workspace folder.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CliSessionReadResult"
         }
       }
     },

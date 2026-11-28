@@ -183,6 +183,13 @@
                       }
                     },
                     {
+                      "id": "sessions",
+                      "type": "block",
+                      "content": {
+                        "mod": "sessions"
+                      }
+                    },
+                    {
                       "id": "side-chat",
                       "type": "block",
                       "content": {

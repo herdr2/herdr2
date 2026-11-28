@@ -32,6 +32,7 @@ Communicate & control
                               hand off, fork, or merge session context across agents
   checkpoint ls|snap|diff|rollback <a|t>
                               hidden Git ref snapshots, pure turn diffs, and dual rollback
+  session ls|read [t]         browse workspace CLI agent sessions & full-access resume commands
 
 Non-agent & files
   exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code

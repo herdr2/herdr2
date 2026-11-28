@@ -322,3 +322,29 @@ cases:
       - "`validate_remote_target_dir` strictly rejects `..` traversal, sibling prefix collisions, and paths outside remote home; unstructured AI responses fall back cleanly to detected remote agents."
     ai_probe_hints:
       - "Verify CRLF-normalized comparison marks skills `up_to_date` across Windows/Unix line endings."
+
+  - id: TC-CORE-059
+    feature: F07
+    title: 工作区级 CLI Agent 历史会话发现、结构化对话读取与 Full-Access 恢复命令生成 (session.list & session.read)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [session.list, session.read]
+      cli: ["h2 session ls", "h2 session read"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated HOME containing workspace-scoped Claude Code, Codex, and Cursor session transcripts across two repositories (`repo-a` and `repo-b`)."
+    steps:
+      - "Call `session.list` / `h2 session ls --cwd <repo-a> --agent claude` and `--agent codex`."
+      - "Call `session.read` / `h2 session read <session_id> --agent claude --cwd <repo-a>`."
+      - "Inspect generated `resume_command` across supported CLI agents (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, `qwen`, `gemini`, `hermes`, `pi`, `omp`)."
+    oracles:
+      - "Only sessions matching the requested workspace (`repo-a`) and CLI agent are returned; `repo-b` sessions are excluded."
+      - "`session.read` parses user prompts, assistant replies, thoughts, and tool calls accurately."
+      - "Every generated `resume_command` carries full-access / permission-bypass flags (`--dangerously-skip-permissions`, `--dangerously-bypass-approvals-and-sandbox`, `--yolo --trust`, `--mode yolo`, `--auto`, etc.) and shell-escapes unsafe session IDs."
+    ai_probe_hints:
+      - "Verify `target: 'machine/t1'` and `on: '<machine>'` forward `session.list` and `session.read` cleanly over SSH."

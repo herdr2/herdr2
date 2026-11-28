@@ -1596,3 +1596,43 @@ pub struct AdapterConfigSetParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListParams {
+    /// Optional terminal (`t1` or `machine/t1`) used to infer workspace folder, CLI agent, and active session ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Workspace folder path (overrides `target`'s cwd when given).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, `qwen`, `gemini`, `pi`, `omp`, `hermes`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Maximum sessions to return (default 60, max 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionReadParams {
+    /// Historical session ID to read.
+    pub session_id: String,
+    /// CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Optional terminal (`t1` or `machine/t1`) used to infer CLI agent or workspace folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Workspace folder path hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Maximum structured entries to return (default 500, max 2000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}

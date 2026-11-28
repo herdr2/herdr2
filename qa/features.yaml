@@ -191,10 +191,14 @@ features:
       - "herdr-core/crates/herdr2/src/api/review.rs"
       - "herdr-core/crates/herdr2/src/review.rs"
       - "herdr-core/crates/herdr2/src/pty_transcript.rs"
+      - "herdr-core/crates/herdr2/src/cli_sessions.rs"
+      - "herdr-core/crates/herdr2/src/cli/session.rs"
     covers:
       rpc:
         - agent.handoff
         - agent.review
+        - session.list
+        - session.read
       app_commands: []
       mods: []
       frames: []
@@ -515,13 +519,13 @@ features:
 
   - id: F16
     subsystem: herdr-app
-    name: 25 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒
+    name: 26 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒
     description: >
       QuickJS `gpui-kit` mod VM (`mods.rs`, `mod_files.rs`), live hot-reload (`app.reload_mods`)
       with `.error` rollback preservation, `mod.open`, `mod.clone`, `files.open`, `overlay.close`,
       `herdr2 check <mod>` static verification, `shared.json` atomic persistence, and complete
       functional coverage of remaining mods (`checkpoints`, `confirm`, `files`, `flash-note`,
-      `help`, `machine-add`, `prompt`, `toast`) and frame screens (`palette`, `settings`, `welcome`).
+      `help`, `machine-add`, `prompt`, `sessions`, `toast`) and frame screens (`palette`, `settings`, `welcome`).
     tiers: [L0-static, L2-app-sandbox]
     source_globs:
       - "herdr-app/src/mods.rs"
@@ -545,6 +549,7 @@ features:
         - help
         - machine-add
         - prompt
+        - sessions
         - toast
       frames:
         - palette
@@ -628,9 +633,9 @@ features:
     subsystem: cross-cutting
     name: 跨仓协议契约、OpenRPC/App Commands/Defaults 一致性与双版本隔离
     description: >
-      Cross-repo static and contract invariants: `herdr-core/schema/h2.openrpc.json` (80 methods)
+      Cross-repo static and contract invariants: `herdr-core/schema/h2.openrpc.json` (87 methods)
       in sync with `api.rs` & `cli.rs`; `herdr-app/src/commands.rs` (94 commands) in sync with
-      `defaults/AGENTS.md` & `defaults/herdr.d.ts`; all 25 `defaults/mods/*` and 3
+      `defaults/AGENTS.md` & `defaults/herdr.d.ts`; all 26 `defaults/mods/*` and 3
       `defaults/frame/*` valid against `layouts/*.json` and `herdr2 check`; `drove-web/src/types.ts`
       aligned with `drove/types.rs`; and strict `herdr2`/`h2`/`H2_*`/`HERDR2_*` isolation from
       legacy `herdr`/`hc`/`HC_*`/`HERDR_*`.

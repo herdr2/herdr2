@@ -1005,3 +1005,133 @@ test("tab bar renders a reopen button on the left only when the sidebar is hidde
     ["layout.show", { id: "sidebar" }],
   ]);
 });
+
+test("Sessions panel button renders right after Checkpoints for CLI agents (including exited-to-shell saved_cli) and hides on ACP or plain shell tabs", () => {
+  const runCalls: unknown[][] = [];
+  const localStore: Record<string, string> = {};
+  let panelHidden = true;
+  let bodyActive = "files";
+  let currentTabs: any[] = [
+    { id: "tab-cli", name: "Claude", active: true },
+    { id: "tab-acp", name: "ACP", active: false },
+    { id: "tab-sh", name: "zsh", active: false },
+  ];
+  let currentPanes: any[] = [
+    { pane: "p-cli", tab: "tab-cli", terminal: "t1", focused: true, program: { name: "Claude Code", key: "claude", agent: true, shell: false } },
+    { pane: "p-acp", tab: "tab-acp", terminal: "a1", acp: true, focused: false, program: { name: "Claude Code", key: "claude", agent: true, shell: false } },
+    { pane: "p-sh", tab: "tab-sh", terminal: "t2", focused: false, program: { name: "zsh", key: "zsh", agent: false, shell: true } },
+  ];
+  let currentTerminals: any[] = [
+    { address: "t1", saved_cli: { kind: "claude", session_id: "sess-1" }, program: { name: "Claude Code", key: "claude", agent: true, shell: false } },
+    { address: "a1", acp: true, program: { name: "Claude Code", key: "claude", agent: true, shell: false } },
+    { address: "t2", program: { name: "zsh", key: "zsh", agent: false, shell: true } },
+  ];
+
+  const customValues = {
+    ...values,
+    spaces: () => [{ id: "s1", active: true, tabs: currentTabs }],
+    panes: () => currentPanes,
+    terminals: () => currentTerminals,
+    settings: () => ({ zoom: 1, language: "zh-CN" }),
+    layout: () => ({
+      id: "root",
+      children: [
+        {
+          id: "panel",
+          hidden: panelHidden,
+          children: [{ id: "panel-body", active: bodyActive }],
+        },
+      ],
+    }),
+    localStorage: {
+      getItem: (k: string) => localStore[k] ?? null,
+      setItem: (k: string, v: string) => { localStore[k] = v; },
+    },
+    run: (cmd: string, args: any) => {
+      runCalls.push([cmd, args]);
+      if (cmd === "layout.select" && args?.stack === "panel-body") bodyActive = args.child;
+      if (cmd === "layout.show" && args?.id === "panel") panelHidden = false;
+      if (cmd === "layout.hide" && args?.id === "panel") panelHidden = true;
+    },
+  };
+
+  const view = new (new Function(
+    ...Object.keys(customValues),
+    source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"),
+  )(...Object.values(customValues)))();
+  view.init();
+
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+
+  // 1) CLI agent tab: shows [文件] [变更] [快照] [会话] in exact order.
+  const cliRoot = view.render() as any;
+  const topIds = cliRoot.nodes.map((n: any) => n?.calls?.id?.[0]).filter(Boolean);
+  const ckptIdx = topIds.indexOf("panel-checkpoints");
+  const sessIdx = topIds.indexOf("panel-sessions");
+  expect(ckptIdx).toBeGreaterThan(-1);
+  expect(sessIdx).toBe(ckptIdx + 1);
+  expect(collectTexts(findById(cliRoot, "panel-sessions"))).toContain("会话");
+
+  // Clicking [会话] opens panel-body -> sessions.
+  findById(cliRoot, "panel-sessions").calls.on_click[0]();
+  expect(panelHidden).toBe(false);
+  expect(bodyActive).toBe("sessions");
+  view.render();
+
+  // 2) CLI agent exits to shell (saved_cli still present): [会话] remains visible so user can run copied resume command.
+  currentPanes[0] = { ...currentPanes[0], program: { name: "zsh", key: "zsh", agent: false, shell: true } };
+  expect(findById(view.render(), "panel-sessions")).not.toBeNull();
+
+  // 3) Switching to ACP tab hides [会话] button and auto-hides the open Sessions panel.
+  runCalls.length = 0;
+  currentTabs = [
+    { id: "tab-cli", name: "Claude", active: false },
+    { id: "tab-acp", name: "ACP", active: true },
+    { id: "tab-sh", name: "zsh", active: false },
+  ];
+  currentPanes[0].focused = false;
+  currentPanes[1].focused = true;
+  const acpRoot = view.render();
+  expect(findById(acpRoot, "panel-sessions")).toBeNull();
+  expect(panelHidden).toBe(true);
+
+  // 4) Plain shell tab also hides [会话].
+  currentTabs = [
+    { id: "tab-cli", name: "Claude", active: false },
+    { id: "tab-acp", name: "ACP", active: false },
+    { id: "tab-sh", name: "zsh", active: true },
+  ];
+  currentPanes[1].focused = false;
+  currentPanes[2].focused = true;
+  expect(findById(view.render(), "panel-sessions")).toBeNull();
+
+  // 5) Switching back to the CLI agent tab restores [会话] and reopens the Sessions panel.
+  currentTabs = [
+    { id: "tab-cli", name: "Claude", active: true },
+    { id: "tab-acp", name: "ACP", active: false },
+    { id: "tab-sh", name: "zsh", active: false },
+  ];
+  currentPanes[2].focused = false;
+  currentPanes[0].focused = true;
+  const backRoot = view.render();
+  expect(findById(backRoot, "panel-sessions")).not.toBeNull();
+  expect(panelHidden).toBe(false);
+  expect(bodyActive).toBe("sessions");
+});

@@ -174,8 +174,8 @@ through them, `layout.switch {name}` picks one; `shared("layout")` is the
 shown one's name. Herdr ships `main` ("Herdr": spaces by machine and the
 agents list on the left, `workspace-chrome`; tabs as pills with a + menu
 that starts a terminal or any installed agent, `new-menu`; panes as cards
-with a header; Files, Changes, and Checkpoints panels on the right,
-`files`, `changes`, and `checkpoints`, opened from the tab bar and remembered
+with a header; Files, Changes, Checkpoints, and CLI Agent Sessions panels on the right,
+`files`, `changes`, `checkpoints`, and `sessions`, opened from the tab bar and remembered
 per space (which ones: shared `"workspace.panels"`, set by the welcome); a
 status bar,
 `workspace-status`), and as examples `terminals` ("Terminals": tabs in

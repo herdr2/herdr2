@@ -1,5 +1,5 @@
 // Context menus (Herdr's items). Opened as a popup with
-// props { tab: "pane" | "tab" | "space" | "agent" | "file" | "global", target }.
+// props { tab: "pane" | "tab" | "space" | "agent" | "file" | "session" | "global", target }.
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];
 // a command "worktree" opens the worktree dialog instead.
 
@@ -209,6 +209,32 @@ function items(p, git) {
       return [
         ...(abs ? [[tr("Copy absolute path", "复制绝对路径"), "clipboard.copy", { text: abs, notice: tr("Copied absolute path", "已复制绝对路径") }]] : []),
         ...(rel ? [[tr("Copy relative path", "复制相对路径"), "clipboard.copy", { text: rel, notice: tr("Copied relative path", "已复制相对路径") }]] : []),
+      ];
+    }
+    case "session": {
+      const cmd = String(tg.resumeCommand ?? "").trim();
+      const sid = String(tg.sessionId ?? "").trim();
+      return [
+        ...(cmd
+          ? [[
+              tr("Copy resume command (full access)", "复制恢复对话命令（Full Access）"),
+              "clipboard.copy",
+              {
+                text: cmd,
+                notice: tr("Copied resume command (full access)", "已复制恢复对话命令（Full Access）"),
+              },
+            ]]
+          : []),
+        ...(sid
+          ? [[
+              tr("Copy session ID", "复制会话 ID"),
+              "clipboard.copy",
+              {
+                text: sid,
+                notice: tr("Copied session ID", "已复制会话 ID"),
+              },
+            ]]
+          : []),
       ];
     }
     default:

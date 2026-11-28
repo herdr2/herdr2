@@ -5,10 +5,10 @@
 ## Summary
 
 - **Features**: 19
-- **Test Cases**: 91
-- **By Tier**: `L0-static`: 4, `L1-core-isolated`: 58, `L2-app-sandbox`: 23, `L3-web-e2e`: 4, `L4-live-llm`: 2
-- **By Mode**: `ai-exploratory`: 2, `hybrid`: 21, `scripted`: 68
-- **By Priority**: `P0`: 54, `P1`: 29, `P2`: 8
+- **Test Cases**: 93
+- **By Tier**: `L0-static`: 4, `L1-core-isolated`: 59, `L2-app-sandbox`: 24, `L3-web-e2e`: 4, `L4-live-llm`: 2
+- **By Mode**: `ai-exploratory`: 2, `hybrid`: 22, `scripted`: 69
+- **By Priority**: `P0`: 54, `P1`: 31, `P2`: 8
 
 ## Feature Coverage
 
@@ -20,7 +20,7 @@
 | `F04` | `herdr-core` | ACP 权限仲裁与结构化 Transcript | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
 | `F05` | `herdr-core` | 内置 stdio MCP 与混合父子编排 | L1-core-isolated | 2 | 5 / 0 / 0 / 0 |
 | `F06` | `herdr-core` | 交互式 PTY 终端、Holder 与 Ghostty VT 镜像 | L1-core-isolated | 8 | 16 / 0 / 0 / 0 |
-| `F07` | `herdr-core` | 上下文 Handoff、Fork、侧聊与代码评审交付 | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
+| `F07` | `herdr-core` | 上下文 Handoff、Fork、侧聊与代码评审交付 | L1-core-isolated | 4 | 8 / 0 / 0 / 0 |
 | `F08` | `herdr-core` | 隐藏 Git Ref 检查点、纯增量 Diff 与回滚二分 | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
 | `F09` | `herdr-core` | 文件、文档、命令执行与跨机 SSH 联邦 | L1-core-isolated | 7 | 16 / 0 / 0 / 0 |
 | `F10` | `herdr-core` | Drove 单守护进程多智能体 DAG 编排与 Worker 协议 | L1-core-isolated, L4-live-llm | 4 | 1 / 0 / 0 / 0 |
@@ -29,7 +29,7 @@
 | `F13` | `herdr-app` | 桌面工作区模型、布局引擎与 Core 文档同步 | L2-app-sandbox | 5 | 2 / 36 / 10 / 0 |
 | `F14` | `herdr-app` | Ghostty-sys GPU 终端渲染、输入选择与程序探测 | L2-app-sandbox | 4 | 4 / 20 / 3 / 0 |
 | `F15` | `herdr-app` | 双通道 Agents 侧栏、非 7501 状态推断与回收站闭环 | L2-app-sandbox, L4-live-llm | 4 | 6 / 16 / 5 / 0 |
-| `F16` | `herdr-app` | 25 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒 | L0-static, L2-app-sandbox | 6 | 2 / 6 / 25 / 3 |
+| `F16` | `herdr-app` | 26 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒 | L0-static, L2-app-sandbox | 7 | 4 / 9 / 26 / 3 |
 | `F17` | `herdr-app` | 桌面控制套接字、自检截图、设置与热更新链路 | L2-app-sandbox | 5 | 3 / 21 / 0 / 3 |
 | `F18` | `drove-web` | Drove Web 只读可观测工作台与 HTTP/SSE 联邦 | L1-core-isolated, L3-web-e2e | 6 | 3 / 0 / 0 / 0 |
 | `F19` | `cross-cutting` | 跨仓协议契约、OpenRPC/App Commands/Defaults 一致性与双版本隔离 | L0-static | 3 | 3 / 0 / 0 / 0 |
@@ -127,13 +127,14 @@ Interactive workspace PTYs via persistent `holder` process (Unix PTY / Windows C
 
 Cross-provider `agent.handoff` supporting `handoff`, `fork` (including isolated git worktree creation), `side_chat`, and `merge_back` across ACP and PTY sessions, plus `agent.review` deterministic line-anchored diff review compiler and delivery to ACP or PTY targets.
 
-**Source globs**: `herdr-core/crates/herdr2/src/api/handoff.rs`, `herdr-core/crates/herdr2/src/handoff.rs`, `herdr-core/crates/herdr2/src/api/review.rs`, `herdr-core/crates/herdr2/src/review.rs`, `herdr-core/crates/herdr2/src/pty_transcript.rs`
+**Source globs**: `herdr-core/crates/herdr2/src/api/handoff.rs`, `herdr-core/crates/herdr2/src/handoff.rs`, `herdr-core/crates/herdr2/src/api/review.rs`, `herdr-core/crates/herdr2/src/review.rs`, `herdr-core/crates/herdr2/src/pty_transcript.rs`, `herdr-core/crates/herdr2/src/cli_sessions.rs`, `herdr-core/crates/herdr2/src/cli/session.rs`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |
 | `TC-CORE-034` | 跨 Provider 上下文 Handoff 与范围轮次裁剪 (Cross-provider agent.handoff turn slicing & max_bytes) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:3 |
 | `TC-CORE-035` | Git Worktree Fork、Side-Chat 侧聊与 Merge-Back 回合 (Handoff fork worktree, side_chat & merge_back) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:3 |
 | `TC-CORE-036` | agent.review 行级 Diff 评审评论投递至 ACP 与 PTY (Line-anchored agent.review delivery & error guards) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:3 |
+| `TC-CORE-059` | 工作区级 CLI Agent 历史会话发现、结构化对话读取与 Full-Access 恢复命令生成 (session.list & session.read) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:2 |
 
 ### F08: 隐藏 Git Ref 检查点、纯增量 Diff 与回滚二分
 
@@ -242,20 +243,21 @@ Unified `agents` sidebar consuming both `terminals` and `agents` event streams (
 | `TC-APP-012` | 桌面 Briefing 简报、Handoff 对话框与 Changes Diff Review 交付 (agent.briefing, agent.handoff, agent.send, agent.send_review) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:3, app:4, mods:2 |
 | `TC-APP-013` | 原位 Prompt 润色、撤销与取消及 Polish Progress 浮卡 (prompt.polish/undo/cancel & polish-progress) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:3, mods:1 |
 
-### F16: 25 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒
+### F16: 26 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒
 
-QuickJS `gpui-kit` mod VM (`mods.rs`, `mod_files.rs`), live hot-reload (`app.reload_mods`) with `.error` rollback preservation, `mod.open`, `mod.clone`, `files.open`, `overlay.close`, `herdr2 check <mod>` static verification, `shared.json` atomic persistence, and complete functional coverage of remaining mods (`checkpoints`, `confirm`, `files`, `flash-note`, `help`, `machine-add`, `prompt`, `toast`) and frame screens (`palette`, `settings`, `welcome`).
+QuickJS `gpui-kit` mod VM (`mods.rs`, `mod_files.rs`), live hot-reload (`app.reload_mods`) with `.error` rollback preservation, `mod.open`, `mod.clone`, `files.open`, `overlay.close`, `herdr2 check <mod>` static verification, `shared.json` atomic persistence, and complete functional coverage of remaining mods (`checkpoints`, `confirm`, `files`, `flash-note`, `help`, `machine-add`, `prompt`, `sessions`, `toast`) and frame screens (`palette`, `settings`, `welcome`).
 
 **Source globs**: `herdr-app/src/mods.rs`, `herdr-app/src/mod_files.rs`, `herdr-app/src/files.rs`, `herdr-app/defaults/mods/*/*`, `herdr-app/defaults/frame/*/*`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |
-| `TC-APP-014` | 全量 25 Mods 与 3 Frames 静态加载校验 (herdr2 check across all 25 mods & 3 frames) | `L0-static` | `scripted` | `P0` | linux, macos, windows | app:2, mods:25, frames:3 |
+| `TC-APP-014` | 全量 26 Mods 与 3 Frames 静态加载校验 (herdr2 check across all 26 mods & 3 frames) | `L0-static` | `scripted` | `P0` | linux, macos, windows | app:2, mods:26, frames:3 |
 | `TC-APP-015` | QuickJS 热重载、mod.clone、.error 回滚与 shared.json 损坏自愈 (app.reload_mods, mod.clone & shared.json) | `L2-app-sandbox` | `scripted` | `P0` | linux, macos, windows | app:4, mods:1 |
 | `TC-APP-016` | Files 面板打开工作区与外部文件及行号跳转 (files.open & files mod) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | app:1, mods:1 |
 | `TC-APP-017` | Checkpoints、Confirm、Prompt 与 Toast 浮层生命周期 (checkpoints, confirm, prompt, toast mods) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:2, mods:4 |
 | `TC-APP-018` | Flash Note 闪念浮窗、底部列表与回收站持久化 (flash-note mod) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | app:2, mods:1 |
 | `TC-APP-019` | 快捷键帮助列表与添加远程机器向导 (help & machine-add mods) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:3, mods:2 |
+| `TC-APP-025` | CLI Agent 会话面板历史浏览与右键复制 Full-Access 恢复命令 (sessions, tabs & menu mods) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:2, app:4, mods:3 |
 
 ### F17: 桌面控制套接字、自检截图、设置与热更新链路
 
@@ -288,12 +290,12 @@ Localhost HTTP/1.1 + SSE server (`127.0.0.1:7799` / `H2_DROVE_PORT`) and React w
 
 ### F19: 跨仓协议契约、OpenRPC/App Commands/Defaults 一致性与双版本隔离
 
-Cross-repo static and contract invariants: `herdr-core/schema/h2.openrpc.json` (80 methods) in sync with `api.rs` & `cli.rs`; `herdr-app/src/commands.rs` (94 commands) in sync with `defaults/AGENTS.md` & `defaults/herdr.d.ts`; all 25 `defaults/mods/*` and 3 `defaults/frame/*` valid against `layouts/*.json` and `herdr2 check`; `drove-web/src/types.ts` aligned with `drove/types.rs`; and strict `herdr2`/`h2`/`H2_*`/`HERDR2_*` isolation from legacy `herdr`/`hc`/`HC_*`/`HERDR_*`.
+Cross-repo static and contract invariants: `herdr-core/schema/h2.openrpc.json` (87 methods) in sync with `api.rs` & `cli.rs`; `herdr-app/src/commands.rs` (94 commands) in sync with `defaults/AGENTS.md` & `defaults/herdr.d.ts`; all 26 `defaults/mods/*` and 3 `defaults/frame/*` valid against `layouts/*.json` and `herdr2 check`; `drove-web/src/types.ts` aligned with `drove/types.rs`; and strict `herdr2`/`h2`/`H2_*`/`HERDR2_*` isolation from legacy `herdr`/`hc`/`HC_*`/`HERDR_*`.
 
 **Source globs**: `herdr-core/schema/h2.openrpc.json`, `herdr-app/src/commands.rs`, `herdr-app/defaults/AGENTS.md`, `herdr-app/defaults/herdr.d.ts`, `drove-web/src/types.ts`, `herdr-core/crates/herdr2/src/drove/types.rs`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |
-| `TC-CONTRACT-001` | 跨仓契约静态校验：OpenRPC 80 方法与 App Commands 94 命令一致性 (h2.openrpc.json <-> api.rs; commands.rs <-> AGENTS.md) | `L0-static` | `scripted` | `P0` | linux, macos, windows | rpc:1 |
+| `TC-CONTRACT-001` | 跨仓契约静态校验：OpenRPC 87 方法与 App Commands 94 命令一致性 (h2.openrpc.json <-> api.rs; commands.rs <-> AGENTS.md) | `L0-static` | `scripted` | `P0` | linux, macos, windows | rpc:1 |
 | `TC-CONTRACT-002` | 跨仓类型与布局静态契约：Layouts <-> Mods 与 Drove Web Types <-> Rust Types (Layouts/Mods & TS/Rust type alignment) | `L0-static` | `scripted` | `P0` | linux, macos, windows | - |
 | `TC-CONTRACT-003` | 双版本彻底隔离静态与运行时扫描 (Strict herdr2/H2_*/HERDR2_* vs legacy herdr/HC_*/HERDR_* isolation) | `L0-static` | `scripted` | `P0` | linux, macos, windows | rpc:2 |

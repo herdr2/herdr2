@@ -153,7 +153,7 @@ cases:
 
   - id: TC-CONTRACT-001
     feature: F19
-    title: 跨仓契约静态校验：OpenRPC 80 方法与 App Commands 94 命令一致性 (h2.openrpc.json <-> api.rs; commands.rs <-> AGENTS.md)
+    title: 跨仓契约静态校验：OpenRPC 87 方法与 App Commands 94 命令一致性 (h2.openrpc.json <-> api.rs; commands.rs <-> AGENTS.md)
     tier: L0-static
     mode: scripted
     priority: P0
@@ -167,7 +167,7 @@ cases:
     preconditions:
       - "Repo checkout with `herdr-core/schema/h2.openrpc.json`, `herdr-core/crates/herdr2/src/api.rs`, `herdr-app/src/commands.rs`, `herdr-app/defaults/AGENTS.md`, and `herdr-app/defaults/herdr.d.ts`."
     steps:
-      - "Parse `h2.openrpc.json` (80 methods) and verify 1:1 parity with `api.rs` `methods!` table."
+      - "Parse `h2.openrpc.json` (87 methods) and verify 1:1 parity with `api.rs` `methods!` table."
       - "Run `herdr2 commands` (94 commands) and verify every command appears in `herdr-app/defaults/AGENTS.md` and matches `commands.rs`."
       - "Compare `herdr-app/defaults/herdr.d.ts` exported commands/hooks against `commands.rs`."
     oracles:

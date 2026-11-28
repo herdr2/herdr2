@@ -19,6 +19,7 @@ mod machine;
 mod output;
 mod run;
 mod server;
+mod session;
 pub(crate) mod skill;
 mod update;
 use file::*;
@@ -260,6 +261,8 @@ enum Cmd {
     },
     /// Hidden Git ref checkpoints, pure turn diffs, and session/workspace rollback (`ls`, `snap`, `diff`, `rollback`).
     Checkpoint(checkpoint::CheckpointCli),
+    /// Inspect historical CLI agent sessions for a workspace and generate full-access resume commands (`ls`, `read`).
+    Session(session::SessionCli),
     /// Swap this h2 for another build and restart core.
     Update {
         /// A herdr2 binary to use (default: download the latest release).
@@ -774,6 +777,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             }
         },
         Cmd::Checkpoint(p) => checkpoint::execute(&paths, p)?,
+        Cmd::Session(p) => session::execute(&paths, p)?,
         Cmd::Wait(mut p) => {
             if p.children.is_none() {
                 p.agent = Some(target(p.agent)?);
@@ -1195,7 +1199,8 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             } else {
                 let target_triple = crate::releases::this_target();
                 let prefer_bundle = crate::platform::prefer_release_bundle();
-                let (file, release_ver) = match crate::releases::download(&m, &target_triple, &scratch.0, prefer_bundle) {
+                let (file, release_ver) = match crate::releases::download(&m, &target_triple, &scratch.0, prefer_bundle)
+                {
                     Ok(f) => (f, m.version.clone()),
                     Err(e) if crate::releases::is_checksum_mismatch(&e) => {
                         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1466,6 +1471,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("checkpoint diff", "checkpoint.diff"),
     ("checkpoint rollback", "checkpoint.rollback"),
     ("checkpoint bisect", "checkpoint.bisect"),
+    ("session ls", "session.list"),
+    ("session read", "session.read"),
     ("adapter status", "adapter.status"),
     ("adapter install", "adapter.install"),
     ("adapter update", "adapter.update"),

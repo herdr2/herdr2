@@ -7,6 +7,7 @@ pub mod attach;
 pub mod checkpoint;
 pub mod checkpoint_safety;
 pub mod cli;
+pub mod cli_sessions;
 pub mod client;
 pub mod config;
 pub mod drove;

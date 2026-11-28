@@ -42,6 +42,7 @@ Communicate & control
                               hand off, fork, or merge session context across agents
   checkpoint ls|snap|diff|rollback <a|t>
                               hidden Git ref snapshots, pure turn diffs, and dual rollback
+  session ls|read [t]         browse workspace CLI agent sessions & full-access resume commands
 
 Non-agent & files
   exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code
@@ -2036,6 +2037,62 @@ Usage: h2 server stop [OPTIONS]
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h2 session
+
+```text
+Inspect historical CLI agent sessions for a workspace and generate full-access resume commands (`ls`, `read`)
+
+Usage: h2 session [OPTIONS] <COMMAND>
+
+Commands:
+  ls    List historical CLI agent sessions for a workspace and CLI agent, with full-access resume commands
+  read  Read structured conversation entries of a historical CLI agent session
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 session ls
+
+```text
+List historical CLI agent sessions for a workspace and CLI agent, with full-access resume commands
+
+Usage: h2 session ls [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  Optional live terminal (`t1` or `machine/t1`) to infer workspace and CLI agent
+
+Options:
+      --cwd <CWD>      Workspace directory path (overrides `target`'s cwd when given)
+      --json           JSON output even in a terminal
+      --agent <AGENT>  CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, `qwen`, `gemini`, `pi`, `hermes`, ...)
+      --on <MACHINE>   Target remote machine (`h2 machine ls`)
+      --limit <LIMIT>  Maximum number of sessions to return (default 60)
+  -h, --help           Print help
+```
+
+## h2 session read
+
+```text
+Read structured conversation entries of a historical CLI agent session
+
+Usage: h2 session read [OPTIONS] <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>  Session ID to inspect
+
+Options:
+      --agent <AGENT>    CLI agent kind (`claude`, `codex`, `agy`, `cursor`, `zcode`, `opencode`, ...)
+      --json             JSON output even in a terminal
+      --target <TARGET>  Optional terminal (`t1` or `machine/t1`) to infer agent, workspace, or remote machine
+      --cwd <CWD>        Workspace directory hint
+      --on <MACHINE>     Target remote machine (`h2 machine ls`)
+      --limit <LIMIT>    Maximum entries to return (default 500)
+  -h, --help             Print help
 ```
 
 ## h2 skill

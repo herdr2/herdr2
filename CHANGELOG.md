@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.0.27
+
+#### 中文
+
+**新增功能**
+- **新增工作区 CLI 智能体会话历史面板（`Sessions`）与 `h2 session ls|read`**：
+  - Core 新增 `session.list`、`session.read` API 及 `h2 session ls|read` 命令（支持本地与远程 SSH 主机），按当前工作区与 CLI 智能体类型（Claude Code、Codex、Antigravity、Cursor、ZCode、OpenCode 等）发现历史会话、读取结构化对话内容，并生成带全权限参数的恢复命令。
+  - 桌面端右侧栏新增「会话（`sessions`）」面板，当当前标签页聚焦或包含交互式 CLI 智能体时自动在标签栏显示入口并同步上下文；支持浏览与搜索历史对话详情、一键在当前或新窗格继续会话，并通过右键菜单复制恢复命令或会话 ID。
+
+---
+
+#### English
+
+**New Features**
+- **Workspace CLI Agent Historical Sessions Panel (`Sessions`) & `h2 session ls|read`**:
+  - Added `session.list` and `session.read` RPC methods plus `h2 session ls|read` CLI commands (supporting both local and remote SSH machines) to discover workspace-scoped historical CLI agent sessions (Claude Code, Codex, Antigravity, Cursor, ZCode, OpenCode, and more), load structured transcripts, and generate full-access resume commands.
+  - Added the right-hand `sessions` panel in the desktop app with contextual tab-bar visibility for active CLI agent tabs, structured conversation browsing, one-click resume in the current or a new pane, and context-menu actions to copy full-access resume commands or session IDs.
+
 ## v2.0.26
 
 #### 中文
