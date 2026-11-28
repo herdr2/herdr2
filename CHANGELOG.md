@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.0.24
+
+#### 中文
+
+**变更与移除**
+- **移除已弃用的 Gemini CLI（`gemini` / `@google/gemini-cli`）支持**：
+  - 从 Core 内置 ACP 预设、Drove 默认角色回退与探针缓存、Handoff/AI 推荐、PTY 转录以及桌面端「智能体与 ACP」目录和各启动入口移除 `gemini`，并自动裁剪历史探针缓存中的过期项。
+  - 完整保留 **Antigravity (`agy`)**（含 `~/.gemini/skills`、`~/.gemini/commands`、`~/.gemini/antigravity*`）以及各厂商的 `gemini-*` 模型配置。
+
+**问题修复**
+- **修复未安装 GitHub Copilot CLI 时因 VS Code 占位垫片导致的误检测与 ACP 探针报错**：
+  - 在 Core 与 App（本机及远程 SSH 的 POSIX/fish/Windows/PowerShell 检测）中自动跳过 VS Code 放置在 `PATH` 的 `copilot-shim`（含符号链接目标，如 `/usr/bin/copilot -> /usr/share/code/bin/copilot-shim/copilot`），同时若 `PATH` 后续目录装有真实的 `copilot` CLI 仍可正常命中。
+- **左侧智能体清单手动修改状态后保持锁定，不再被程序或 AI 改写**：
+  - 用户在状态菜单手动设置 `idle` / `working` / `blocked` / `done` 后，不再因键盘输入、发送消息、新轮次、OSC 7501 上报或子智能体汇报而自动释放，并完全跳过 VT 推断与 AI 状态分类，直到用户主动切回「自动识别」或 CLI 智能体退出回到普通 shell。
+- **修复「待确认（`blocked`）」状态在进入智能体时闪烁消失后又闪回的问题**：
+  - 新增「待确认」状态锁定（`BlockedHold`）：智能体一旦判定为 `blocked`，在用户真正与该智能体对话（终端键盘/粘贴输入、Peek/侧栏发送消息或审批/拒绝/中断、`turn` 推进）或手动修改状态之前，切入聚焦、窗口缩放、鼠标点击/滚动、TUI 局部重绘与列表刷新均不再清除或重判其内部与左侧清单状态。
+
+---
+
+#### English
+
+**Removals**
+- **Removed Deprecated Gemini CLI (`gemini` / `@google/gemini-cli`) Support**:
+  - Removed the deprecated `gemini` built-in ACP preset, Drove probe/fallback entries, Handoff/AI preset references, PTY transcript provider, and desktop Settings / launcher entries, while pruning stale cached probe entries.
+  - Fully preserved **Antigravity (`agy`)** (`~/.gemini/skills`, `~/.gemini/commands`, `~/.gemini/antigravity*`) and `gemini-*` model slugs across providers.
+
+**Bug Fixes**
+- **Fixed False-Positive Copilot CLI Detection from VS Code's `copilot-shim` Stub**:
+  - Skipped VS Code's placeholder `copilot-shim` path segment (including symlink targets such as `/usr/bin/copilot -> /usr/share/code/bin/copilot-shim/copilot`) across `herdr-core` binary/skill resolution and `herdr-app` local/remote shell detection (POSIX, fish, Windows PATH, and PowerShell), while continuing `PATH` lookup when a real `copilot` binary is installed later on `PATH`.
+- **Preserved Manual Agent Status Overrides Without Automatic Program/AI Rewrites**:
+  - Removed automatic clearing of `herdr.status` / `manual_status` on keystrokes, prompt sends, permission resolutions, turns, OSC 7501 updates, or child notes, and skipped VT/AI status detection while manually locked until the user explicitly switches back to "Auto detect" or the CLI agent exits to shell.
+- **Fixed "Needs You" (`blocked`) Status Flickering When Entering an Agent**:
+  - Added a `BlockedHold` latch so once an agent is judged `blocked`, its internal and sidebar status stays locked across focus, resize, clicks, scrolling, TUI redraws, and list refreshes—without re-running VT detection or AI classification—until the user actually converses with the agent (terminal input, Peek/CLI send/approve/deny/interrupt, new turn) or manually changes its status.
+
 ## v2.0.23
 
 #### 中文

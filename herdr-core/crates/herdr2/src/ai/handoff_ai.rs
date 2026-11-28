@@ -22,7 +22,7 @@ const RECOMMEND_TIMEOUT: Duration = Duration::from_secs(12);
 const DISTILL_CACHE_TTL: Duration = Duration::from_secs(900);
 const RECOMMEND_CACHE_TTL: Duration = Duration::from_secs(60);
 
-const DEFAULT_PRESET_POOL: &[&str] = &["claude", "codex", "gemini", "agy", "cursor", "opencode", "qwen", "kimi"];
+const DEFAULT_PRESET_POOL: &[&str] = &["claude", "codex", "agy", "cursor", "opencode", "qwen", "kimi"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +42,7 @@ pub struct HandoffRecommendParams {
 pub struct HandoffRecommendResult {
     /// Recommended handoff mode: `"handoff"`, `"fork"`, or `"side-chat"`.
     pub recommended_kind: String,
-    /// Recommended complementary target preset (e.g. `"codex"`, `"claude"`, `"gemini"`).
+    /// Recommended complementary target preset (e.g. `"codex"`, `"claude"`, `"agy"`).
     pub recommended_preset: String,
     /// Short human-readable explanation for the recommendation.
     pub reason: String,
@@ -469,7 +469,7 @@ fn normalize_preset(raw: &str) -> Option<String> {
     if low.contains("antigravity") || low == "agy" {
         return Some("agy".into());
     }
-    for key in ["claude", "codex", "gemini", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "trae", "pi"] {
+    for key in ["claude", "codex", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "trae", "pi"] {
         if low.contains(key) {
             return Some(key.into());
         }
@@ -500,7 +500,7 @@ fn heuristic_recommend(
 ) -> HandoffRecommendResult {
     let stuck = sig.error_count + sig.failed_tool_count >= 2;
     if stuck {
-        let preset = pick_from_pool(pool, &["codex", "claude", "gemini", "agy"], src_preset);
+        let preset = pick_from_pool(pool, &["codex", "claude", "agy"], src_preset);
         let note = if sig.last_error_snippet.is_empty() {
             if is_zh {
                 "上游连续遇到报错，请换一种排查思路定位根因并避免重复失败方案。".into()
@@ -533,7 +533,7 @@ fn heuristic_recommend(
     }
 
     if sig.ui_hits > sig.systems_hits && sig.ui_hits > 0 {
-        let preset = pick_from_pool(pool, &["gemini", "claude", "agy", "cursor"], src_preset);
+        let preset = pick_from_pool(pool, &["agy", "claude", "cursor"], src_preset);
         return HandoffRecommendResult {
             recommended_kind: "handoff".into(),
             recommended_preset: preset,
@@ -553,7 +553,7 @@ fn heuristic_recommend(
     }
 
     if sig.question_hits >= 2 && sig.error_count == 0 && sig.failed_tool_count == 0 {
-        let preset = pick_from_pool(pool, &["claude", "gemini", "codex"], src_preset);
+        let preset = pick_from_pool(pool, &["claude", "agy", "codex"], src_preset);
         return HandoffRecommendResult {
             recommended_kind: "side-chat".into(),
             recommended_preset: preset,
@@ -572,7 +572,7 @@ fn heuristic_recommend(
         };
     }
 
-    let preset = pick_from_pool(pool, &["claude", "codex", "gemini", "agy"], src_preset);
+    let preset = pick_from_pool(pool, &["claude", "codex", "agy"], src_preset);
     HandoffRecommendResult {
         recommended_kind: "handoff".into(),
         recommended_preset: preset,
@@ -809,7 +809,7 @@ mod tests {
             Some("claude"),
             None,
             &entries,
-            &["claude".into(), "codex".into(), "gemini".into()],
+            &["claude".into(), "codex".into(), "agy".into()],
             Some("zh-CN"),
         )
         .await;
@@ -849,7 +849,7 @@ mod tests {
             Some("claude"),
             Some("claude-sonnet-4"),
             &entries,
-            &["claude".into(), "codex".into(), "gemini".into()],
+            &["claude".into(), "codex".into(), "agy".into()],
             Some("zh-CN"),
         )
         .await;
@@ -866,7 +866,7 @@ mod tests {
             Some("claude"),
             Some("claude-sonnet-4"),
             &entries,
-            &["claude".into(), "codex".into(), "gemini".into()],
+            &["claude".into(), "codex".into(), "agy".into()],
             Some("zh-CN"),
         )
         .await;

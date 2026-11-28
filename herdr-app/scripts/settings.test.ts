@@ -133,23 +133,23 @@ test("roleChain and applyRoleChain support 4+ agents, reordering, and primary pr
     fallbacks: [
       { agent: "codex", model: "gpt-5.4", effort: "high" },
       { agent: "agy", model: null, effort: "medium" },
-      { agent: "gemini", model: "gemini-2.5-pro", effort: "low" },
+      { agent: "opencode", model: "claude-sonnet-4-6", effort: "low" },
     ],
   };
 
   const chain = view.roleChain(role);
-  expect(chain.map((c: any) => c.agent)).toEqual(["claude", "codex", "agy", "gemini"]);
+  expect(chain.map((c: any) => c.agent)).toEqual(["claude", "codex", "agy", "opencode"]);
 
   // Promote #3 (agy) to #1
   const reordered = [chain[2], chain[0], chain[1], chain[3]];
   view.applyRoleChain(role, reordered);
   expect(role.primary).toEqual({ agent: "agy", model: null, effort: "medium" });
-  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["claude", "codex", "gemini"]);
+  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["claude", "codex", "opencode"]);
 
   // Remove #1 -> #2 (claude) becomes new primary, remaining fallbacks preserved
   view.applyRoleChain(role, reordered.slice(1));
   expect(role.primary).toEqual({ agent: "claude", model: "claude-opus-4-6", effort: "high" });
-  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["codex", "gemini"]);
+  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["codex", "opencode"]);
 });
 
 test("maybeAutoProbeDrove reuses saved fullProbe models without re-probing", () => {
@@ -813,7 +813,7 @@ test("droveProbeSummary separates healthy and errored installed agents and forma
           error: "ACP initialize failed: process exited\nstderr:\nError: Unauthorized (401)",
         },
         { id: "agy", installed: true, models: [], error: "`agy models` exited with code 1\nstderr:\nPlease login first" },
-        { id: "gemini", installed: false, models: [], error: null },
+        { id: "opencode", installed: false, models: [], error: null },
       ],
     },
   };
@@ -822,7 +822,7 @@ test("droveProbeSummary separates healthy and errored installed agents and forma
   expect(summary.installed.map((a: any) => a.id)).toEqual(["claude", "codex", "agy"]);
   expect(summary.ready.map((a: any) => a.id)).toEqual(["claude"]);
   expect(summary.errored.map((a: any) => a.id)).toEqual(["codex", "agy"]);
-  expect(summary.missing.map((a: any) => a.id)).toEqual(["gemini"]);
+  expect(summary.missing.map((a: any) => a.id)).toEqual(["opencode"]);
 
   expect(view.formatAgentProbeError(summary.errored[0].error)).toBe(
     "ACP initialize failed: process exited · Error: Unauthorized (401)",
@@ -1594,7 +1594,8 @@ test("Agents & ACP lists all supported agents, distinguishes npx fallback from i
   expect(rows.length).toBeGreaterThanOrEqual(20);
   expect(rows.find((r: any) => r.id === "claude")).toMatchObject({ cliInstalled: true, acpInstalled: true, acpReady: true });
   expect(rows.find((r: any) => r.id === "codex")).toMatchObject({ cliInstalled: true, acpInstalled: false, adapterMissing: true, acpReady: false });
-  expect(rows.find((r: any) => r.id === "gemini")).toMatchObject({ cliInstalled: false, acpMode: "builtin", acpInstalled: false });
+  expect(rows.find((r: any) => r.id === "gemini")).toBeUndefined();
+  expect(rows.find((r: any) => r.id === "opencode")).toMatchObject({ cliInstalled: false, acpMode: "builtin", acpInstalled: false });
   expect(rows.find((r: any) => r.id === "glm")).toMatchObject({ standaloneAcp: true, acpMode: "managed" });
 
   // 3. Adapter install error is surfaced in agentIssues() and can be focused for AI troubleshooting.
@@ -1614,12 +1615,12 @@ test("Agents & ACP lists all supported agents, distinguishes npx fallback from i
   expect(closed).toBe(1);
 
   // 4. One-click CLI install launches the official install command on the selected machine.
-  const geminiRow = rows.find((r: any) => r.id === "gemini");
+  const opencodeRow = rows.find((r: any) => r.id === "opencode");
   view.droveMachine = "devbox";
-  view.installAgentCli(geminiRow, cx);
+  view.installAgentCli(opencodeRow, cx);
   expect(ran[1].cmd).toBe("tab.new");
   expect(ran[1].args.space).toBe("sp-remote");
-  expect(ran[1].args.argv).toEqual(["npm", "install", "-g", "@google/gemini-cli"]);
+  expect(ran[1].args.argv).toEqual(["npm", "install", "-g", "opencode-ai"]);
   expect(closed).toBe(2);
 
   // 5. AI-assisted install lets the user choose helper agent, model, and effort for both Agent CLI and separate ACP install.

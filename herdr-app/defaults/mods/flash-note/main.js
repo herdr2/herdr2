@@ -104,7 +104,6 @@ const FALLBACK_PRESETS = [
   { key: "claude", name: "Claude Code", icon: "icons/claude.svg", tint: false, installed: true, run: ["claude", "--dangerously-skip-permissions"] },
   { key: "codex", name: "Codex", icon: "icons/codex.svg", tint: false, installed: true, run: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"] },
   { key: "antigravity", name: "Antigravity", icon: "icons/antigravity.svg", tint: false, installed: true, run: ["agy", "--dangerously-skip-permissions"] },
-  { key: "gemini", name: "Gemini", icon: "icons/gemini.svg", tint: true, installed: true, run: ["gemini", "--yolo"] },
   { key: "opencode", name: "OpenCode", icon: "icons/opencode.svg", tint: true, installed: true, run: ["opencode", "--auto"] },
 ];
 

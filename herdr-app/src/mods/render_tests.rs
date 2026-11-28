@@ -2925,8 +2925,9 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(probe_err_tree.contains("st-ag-row-claude"), "Installed agent row should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-row-codex"), "Missing-ACP agent row should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-row-inst-codex"), "Missing managed ACP adapter row should expose one-click install button: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-ag-row-gemini"), "Uninstalled supported agent should be shown by default: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-ag-row-cli-gemini"), "Uninstalled supported agent should expose one-click CLI install button: {probe_err_tree}");
+    assert!(!probe_err_tree.contains("st-ag-row-gemini"), "Deprecated Gemini CLI should no longer appear in supported agents: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-opencode"), "Uninstalled supported agent should be shown by default: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-cli-opencode"), "Uninstalled supported agent should expose one-click CLI install button: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-row-ai-cursor"), "Errored agent row should expose direct AI fix button: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-config-card"), "ACP configuration card should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-adapter-check"), "Up-to-date managed adapters should render Check ACP Updates button instead of Update ACP: {probe_err_tree}");

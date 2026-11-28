@@ -1027,7 +1027,6 @@ fn acp_login_command(agent_key: &str) -> Option<&'static [&'static str]> {
         "codex" => Some(&["codex", "login"]),
         "copilot" | "github-copilot" => Some(&["copilot", "login"]),
         "kimi" | "kimi-code" => Some(&["kimi", "login"]),
-        "gemini" | "gemini-cli" => Some(&["gemini"]),
         "qwen" | "qwen-code" => Some(&["qwen"]),
         "pi" | "pi-acp" => Some(&["pi"]),
         _ => None,
@@ -1055,7 +1054,6 @@ fn acp_agent_identity(record: &Value) -> (String, String) {
         "cursor" | "cursor-agent" => "Cursor".to_string(),
         "claude" | "claude-code" => "Claude".to_string(),
         "codex" => "Codex".to_string(),
-        "gemini" | "gemini-cli" => "Gemini".to_string(),
         "copilot" | "github-copilot" => "Copilot".to_string(),
         "kimi" | "kimi-code" => "Kimi".to_string(),
         "qwen" | "qwen-code" => "Qwen".to_string(),
@@ -1485,11 +1483,52 @@ struct Watched {
 struct ManualStatus {
     /// `Some("idle" | "working" | "blocked" | "done")`, or `None` while clearing (`"auto"`).
     status: Option<String>,
-    turn: u64,
-    reported_state: Option<String>,
     set_at: Instant,
     /// True once `herdr.status` has been observed back from core (or originally hydrated from core).
     label_synced: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BlockedHold {
+    /// Preserved AI verdict metadata when `"blocked"` came from AI arbitration.
+    ai_kind: Option<String>,
+    ai_summary: Option<String>,
+    /// Terminal keyboard/paste watermark captured when entering `"blocked"`.
+    latched_typed_at: Option<Instant>,
+    /// Core turn watermark captured when entering `"blocked"`.
+    latched_turn: u64,
+    /// Whether an ACP `pending_permission` was present when latched.
+    had_pending_permission: bool,
+    /// Whether this address is a headless ACP agent.
+    is_acp: bool,
+}
+
+fn should_release_blocked_hold(
+    hold: &BlockedHold,
+    has_manual_status: bool,
+    cur_typed_at: Option<Instant>,
+    cur_turn: u64,
+    has_pending_permission: bool,
+    raw_state: Option<&str>,
+) -> bool {
+    if has_manual_status {
+        return true;
+    }
+    if cur_typed_at > hold.latched_typed_at {
+        return true;
+    }
+    if cur_turn > hold.latched_turn {
+        return true;
+    }
+    if hold.is_acp {
+        if hold.had_pending_permission && !has_pending_permission {
+            return true;
+        }
+        if raw_state == Some("working") {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_manual_status_label(raw: &str) -> Option<(String, Option<u64>)> {
@@ -1631,6 +1670,9 @@ pub struct AppWindow {
     rename_focus: RenameFocus,
     /// Manual status overrides (`herdr.status`), keyed by terminal/agent address.
     manual_statuses: HashMap<String, ManualStatus>,
+    /// Latched `"blocked"` ("Needs you") holds: once an agent is judged `"blocked"`, its internal
+    /// and sidebar status stays locked until the user converses with it or manually changes status.
+    blocked_holds: HashMap<String, BlockedHold>,
     /// Recently written `herdr.name` labels awaiting Core echo so in-flight listings don't revert renames.
     pending_names: HashMap<String, (String, Instant)>,
     /// Recently written `herdr.trashed` labels awaiting Core echo so in-flight listings don't revert trash/restore.
@@ -1796,6 +1838,7 @@ impl AppWindow {
             side_panel_auto_hidden: false,
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
+            blocked_holds: HashMap::new(),
             pending_names: HashMap::new(),
             pending_trash: HashMap::new(),
             ai_terminal_states: HashMap::new(),
@@ -4624,34 +4667,29 @@ impl AppWindow {
         Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.name", effective.to_owned(), cx);
     }
 
-    /// Resolves and auto-releases any manual status override (`herdr.status`) for `addr`.
-    fn resolve_manual_status(&mut self, addr: &str, cx: &App) -> Option<String> {
+    /// Resolves any explicit manual status override (`herdr.status`) for `addr`.
+    /// Manual status remains pinned until the user explicitly switches it back to `"auto"`
+    /// (or the CLI agent exits back to shell / closes).
+    fn resolve_manual_status(&mut self, addr: &str) -> Option<String> {
         let rec = self.live.get(addr)?;
-        let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-        let reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
-        let rep_state = rec.pointer("/report/state").and_then(Value::as_str).map(str::to_owned);
         let label_raw = rec.pointer("/labels/herdr.status").and_then(Value::as_str).unwrap_or_default().to_owned();
         let now = Instant::now();
 
         if !self.manual_statuses.contains_key(addr) && !label_raw.is_empty()
-            && let Some((word, parsed_turn)) = parse_manual_status_label(&label_raw)
+            && let Some((word, _)) = parse_manual_status_label(&label_raw)
         {
             self.manual_statuses.insert(addr.to_owned(), ManualStatus {
                 status: Some(word),
-                turn: parsed_turn.unwrap_or(turn),
-                reported_state: rep_state.clone(),
                 set_at: now,
                 label_synced: true,
             });
         } else if let Some(entry) = self.manual_statuses.get_mut(addr) {
             if !label_raw.is_empty() {
-                if let Some((word, parsed_turn)) = parse_manual_status_label(&label_raw) {
+                if let Some((word, _)) = parse_manual_status_label(&label_raw) {
                     if entry.status.as_deref() == Some(word.as_str()) {
                         entry.label_synced = true;
                     } else if now.saturating_duration_since(entry.set_at) > Duration::from_millis(800) {
                         entry.status = Some(word);
-                        entry.turn = parsed_turn.unwrap_or(turn);
-                        entry.reported_state = rep_state.clone();
                         entry.set_at = now;
                         entry.label_synced = true;
                     }
@@ -4659,48 +4697,130 @@ impl AppWindow {
             } else if entry.status.is_some()
                 && (entry.label_synced || now.saturating_duration_since(entry.set_at) > Duration::from_millis(800))
             {
-                // Core cleared `herdr.status` (user interaction or inter-agent communication).
+                // Explicit reset via core label (e.g. from another window or `h2 label`).
                 self.manual_statuses.remove(addr);
                 return None;
             }
         }
 
-        let Some((st_opt, entry_turn, entry_rep, entry_set_at)) = self
-            .manual_statuses
-            .get(addr)
-            .map(|e| (e.status.clone(), e.turn, e.reported_state.clone(), e.set_at))
-        else {
-            return None;
-        };
+        let st_opt = self.manual_statuses.get(addr).and_then(|e| e.status.clone());
+        if st_opt.is_none() && label_raw.is_empty() {
+            self.manual_statuses.remove(addr);
+        }
+        st_opt
+    }
 
-        let Some(st) = st_opt else {
-            if label_raw.is_empty() {
-                self.manual_statuses.remove(addr);
+    fn latest_typed_at(&self, addr: &str, cx: &App) -> Option<Instant> {
+        self.terms
+            .values()
+            .filter(|t| t.address == addr)
+            .filter_map(|t| t.view.read(cx).last_typed_at())
+            .max()
+    }
+
+    fn latch_blocked_hold(&mut self, addr: &str, ai_kind: Option<String>, ai_summary: Option<String>, cx: &App) {
+        if self.manual_statuses.get(addr).is_some_and(|e| e.status.is_some()) {
+            return;
+        }
+        let Some(rec) = self.live.get(addr) else {
+            return;
+        };
+        if rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+            return;
+        }
+        let is_acp = is_acp_addr(addr) || rec.get("acp").and_then(Value::as_bool) == Some(true);
+        let is_agent_prog = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
+        if !is_acp && !is_agent_prog {
+            return;
+        }
+        if let Some(existing) = self.blocked_holds.get_mut(addr) {
+            if ai_kind.is_some() {
+                existing.ai_kind = ai_kind;
             }
-            return None;
-        };
+            if ai_summary.is_some() {
+                existing.ai_summary = ai_summary;
+            }
+            return;
+        }
+        let latched_typed_at = self.latest_typed_at(addr, cx);
+        let latched_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+        let had_pending_permission = rec.get("pending_permission").is_some_and(|v| !v.is_null());
+        self.blocked_holds.insert(addr.to_owned(), BlockedHold {
+            ai_kind,
+            ai_summary,
+            latched_typed_at,
+            latched_turn,
+            had_pending_permission,
+            is_acp,
+        });
+    }
 
-        let mut release = turn > entry_turn
-            || (reported && rep_state.is_some() && rep_state != entry_rep);
-        if !release && !is_acp_addr(addr)
-            && let Some(view) = self.best_terminal_view(addr, cx)
-        {
-            let v = view.read(cx);
-            if v.last_typed_at().is_some_and(|t| t > entry_set_at + Duration::from_millis(50)) {
-                release = true;
+    fn release_blocked_hold(&mut self, addr: &str) -> bool {
+        if self.blocked_holds.remove(addr).is_some() {
+            self.ai_terminal_states.remove(addr);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reconciles active `"blocked"` holds against user conversation / explicit manual overrides,
+    /// and re-applies still-held `"blocked"` state onto `self.live` so focus/resize/redraw/list-refresh
+    /// events can never clear or flicker `"blocked"`.
+    /// Returns `(released_addrs, live_updated)`.
+    fn reconcile_blocked_holds(&mut self, cx: &App) -> (HashSet<String>, bool) {
+        let mut released: HashSet<String> = HashSet::new();
+        for target in mods::take_interacted_agents() {
+            if self.release_blocked_hold(&target) {
+                released.insert(target);
             }
         }
-
-        if release {
-            if let Some(entry) = self.manual_statuses.get_mut(addr) {
-                entry.status = None;
+        let held_addrs: Vec<String> = self.blocked_holds.keys().cloned().collect();
+        for addr in held_addrs {
+            let Some(rec) = self.live.get(&addr) else {
+                self.blocked_holds.remove(&addr);
+                continue;
+            };
+            let Some(hold) = self.blocked_holds.get(&addr) else {
+                continue;
+            };
+            let has_manual = self.manual_statuses.get(&addr).is_some_and(|e| e.status.is_some())
+                || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+            let cur_typed_at = self.latest_typed_at(&addr, cx);
+            let cur_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+            let has_pending_permission = rec.get("pending_permission").is_some_and(|v| !v.is_null());
+            let raw_state = rec.get("raw_state").and_then(Value::as_str);
+            if should_release_blocked_hold(hold, has_manual, cur_typed_at, cur_turn, has_pending_permission, raw_state) {
+                self.release_blocked_hold(&addr);
+                released.insert(addr);
             }
-            if !label_raw.is_empty() {
-                Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.status", String::new(), cx);
-            }
-            return None;
         }
-        Some(st)
+        let mut live_updated = false;
+        let still_held: Vec<(String, Option<String>, Option<String>)> = self
+            .blocked_holds
+            .iter()
+            .map(|(a, h)| (a.clone(), h.ai_kind.clone(), h.ai_summary.clone()))
+            .collect();
+        for (addr, ai_kind, ai_summary) in still_held {
+            if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                let want_status = json!("blocked");
+                let want_kind = ai_kind.as_deref().map_or(Value::Null, |s| json!(s));
+                let want_summary = ai_summary.as_deref().map_or(Value::Null, |s| json!(s));
+                if obj.get("status") != Some(&want_status) {
+                    obj.insert("status".into(), want_status);
+                    live_updated = true;
+                }
+                if obj.get("ai_status_kind") != Some(&want_kind) {
+                    obj.insert("ai_status_kind".into(), want_kind);
+                    live_updated = true;
+                }
+                if obj.get("ai_status_summary") != Some(&want_summary) {
+                    obj.insert("ai_status_summary".into(), want_summary);
+                    live_updated = true;
+                }
+            }
+        }
+        (released, live_updated)
     }
 
     /// Infer execution state on live non-7501 PTY terminals running an interactive coding CLI agent.
@@ -4722,6 +4842,8 @@ impl AppWindow {
         }
         let mut updates: Vec<(String, Value, Value, Value, Option<String>, Option<String>)> = Vec::new();
         let mut clear_verdicts: Vec<String> = Vec::new();
+        let mut clear_ai_fields: Vec<String> = Vec::new();
+        let mut newly_blocked: Vec<(String, Option<String>, Option<String>)> = Vec::new();
         let mut jobs: Vec<ArbitrationJob> = Vec::new();
         let can_ai = self.core.supports_ai() && self.ai_unavailable_until.is_none_or(|until| now >= until);
 
@@ -4734,6 +4856,17 @@ impl AppWindow {
                 if self.ai_terminal_states.contains_key(addr) {
                     clear_verdicts.push(addr.clone());
                 }
+                if manually_held
+                    && (rec.get("ai_status_summary").is_some_and(|v| !v.is_null())
+                        || rec.get("ai_status_kind").is_some_and(|v| !v.is_null()))
+                {
+                    clear_ai_fields.push(addr.clone());
+                }
+                continue;
+            }
+            if self.blocked_holds.contains_key(addr) {
+                // Already latched as "blocked" until the user converses or manually changes status:
+                // never re-run deterministic VT detection or AI classification.
                 continue;
             }
             let is_agent = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
@@ -4926,8 +5059,22 @@ impl AppWindow {
         for addr in clear_verdicts {
             self.ai_terminal_states.remove(&addr);
         }
-        let changed = !updates.is_empty();
+        let mut changed = !updates.is_empty();
+        for addr in clear_ai_fields {
+            if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                obj.insert("ai_status_summary".into(), Value::Null);
+                obj.insert("ai_status_kind".into(), Value::Null);
+                changed = true;
+            }
+        }
         for (addr, want, want_summary, want_kind, fill_sem, fill_micro) in updates {
+            if want.as_str() == Some("blocked") {
+                newly_blocked.push((
+                    addr.clone(),
+                    want_kind.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+                    want_summary.as_str().filter(|s| !s.is_empty()).map(str::to_owned),
+                ));
+            }
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("status".into(), want);
                 obj.insert("ai_status_summary".into(), want_summary);
@@ -4939,6 +5086,9 @@ impl AppWindow {
                     obj.insert("micro_summary".into(), Value::String(ms));
                 }
             }
+        }
+        for (addr, ai_kind, ai_summary) in newly_blocked {
+            self.latch_blocked_hold(&addr, ai_kind, ai_summary, cx);
         }
         for job in jobs {
             self.ai_inflight.insert(job.addr.clone());
@@ -4986,7 +5136,10 @@ impl AppWindow {
                     let allowed_reported = matches!(core_state, Some("idle" | "done"))
                         || (core_state == Some("blocked") && !matches!(core_kind, Some("permission" | "auth")));
                     if rec.get("acp").and_then(Value::as_bool) == Some(true)
+                        || this.blocked_holds.contains_key(&addr)
+                        || this.manual_statuses.get(&addr).is_some_and(|e| e.status.is_some())
                         || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                        || rec.pointer("/labels/herdr.status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
                         || rec.pointer("/program/agent").and_then(Value::as_bool) != Some(true)
                         || (rec_reported && !allowed_reported)
                     {
@@ -5048,6 +5201,8 @@ impl AppWindow {
                     };
                     this.ai_terminal_states.insert(addr.clone(), verdict);
                     let child = rec.get("parent").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
+                    let hold_kind = (!kind.is_empty()).then(|| kind.clone());
+                    let hold_summary = (!summary.is_empty()).then(|| summary.clone());
                     if let Some(obj) = this.live.get_mut(&addr).and_then(Value::as_object_mut) {
                         obj.insert("status".into(), Value::String(mapped_state.to_owned()));
                         obj.insert(
@@ -5064,6 +5219,9 @@ impl AppWindow {
                         if !micro_summary.is_empty() {
                             obj.insert("micro_summary".into(), Value::String(micro_summary));
                         }
+                    }
+                    if mapped_state == "blocked" {
+                        this.latch_blocked_hold(&addr, hold_kind, hold_summary, cx);
                     }
                     let app = this
                         .live
@@ -5819,6 +5977,7 @@ impl AppWindow {
         self.live_order = order;
         self.shell_child_seen.retain(|a| self.live.contains_key(a));
         self.manual_statuses.retain(|a, _| self.live.contains_key(a));
+        self.blocked_holds.retain(|a, _| self.live.contains_key(a));
         let now_pending = Instant::now();
         self.pending_names.retain(|addr, (want, at)| {
             let Some(rec) = self.live.get(addr) else {
@@ -5906,6 +6065,7 @@ impl AppWindow {
                     .and_then(Value::as_str)
                     .is_some_and(|s| !s.is_empty());
                 self.manual_statuses.remove(&addr);
+                self.blocked_holds.remove(&addr);
                 if had_manual_label {
                     Self::write_core_label(self.core.clone(), addr.clone(), "herdr.status", String::new(), cx);
                 }
@@ -5937,11 +6097,15 @@ impl AppWindow {
                 }
                 continue;
             }
-            let manual = self.resolve_manual_status(&addr, cx);
+            let manual = self.resolve_manual_status(&addr);
+            if manual.is_some() {
+                self.blocked_holds.remove(&addr);
+            }
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("manual_status".into(), manual.as_deref().map_or(Value::Null, |s| json!(s)));
             }
         }
+        let _ = self.reconcile_blocked_holds(cx);
         self.refresh_inferred_statuses(cx);
         self.refresh_missing_semantic_digests(cx);
         // A new sub-agent or updated inferred state changes `terminals()`.
@@ -5976,7 +6140,7 @@ impl AppWindow {
             if self.closing_terminals.contains_key(addr) {
                 continue;
             }
-            let manual = self.resolve_manual_status(addr, cx);
+            let manual = self.resolve_manual_status(addr);
             let prev_manual = self.live.get(addr).and_then(|r| r.get("manual_status")).and_then(Value::as_str).map(str::to_owned);
             if prev_manual != manual {
                 republished = true;
@@ -5988,7 +6152,9 @@ impl AppWindow {
                 }
             }
         }
-        if (!listed || manual_released) && self.refresh_inferred_statuses(cx) {
+        let (released_blocked, blocked_updated) = self.reconcile_blocked_holds(cx);
+        republished |= blocked_updated;
+        if (!listed || manual_released || !released_blocked.is_empty()) && self.refresh_inferred_statuses(cx) {
             republished = true;
         }
         if !listed {
@@ -6027,6 +6193,24 @@ impl AppWindow {
                 .or_else(|| word.as_ref().and_then(|_| rec.pointer("/program/key").and_then(Value::as_str)))
                 .map(str::to_owned);
             let looking = visible.contains(&addr) && self.window_active;
+            let should_latch_blocked = if manual.is_none()
+                && word.as_deref() == Some("blocked")
+                && !self.blocked_holds.contains_key(&addr)
+                && !released_blocked.contains(&addr)
+            {
+                let answered_since_output = !is_acp
+                    && self
+                        .best_terminal_view(&addr, cx)
+                        .map(|v| v.read(cx))
+                        .is_some_and(|v| matches!((v.last_output_at(), v.last_typed_at()), (Some(out), Some(typed)) if typed > out));
+                (!answered_since_output).then(|| {
+                    let ai_kind = rec.get("ai_status_kind").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+                    let ai_summary = rec.get("ai_status_summary").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+                    (ai_kind, ai_summary)
+                })
+            } else {
+                None
+            };
             changed |= self.model.set_manual_status(&addr, manual, app.clone());
             let prev = self.model.agents.get(&addr).and_then(|a| a.word.clone());
             let child = rec.get("parent").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
@@ -6050,6 +6234,9 @@ impl AppWindow {
             let core_status_ms = rec.get("status_ms").and_then(Value::as_u64);
             let is_starting = rec.get("raw_state").and_then(Value::as_str) == Some("starting") && turn == 0;
             changed |= self.model.sync_core_timing(&addr, core_ws, core_work_ms, core_total_ms, core_status_ms, is_starting);
+            if let Some((ai_kind, ai_summary)) = should_latch_blocked {
+                self.latch_blocked_hold(&addr, ai_kind, ai_summary, cx);
+            }
             if let Some(a) = self.model.agents.get(&addr)
                 && let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut)
             {
@@ -6614,7 +6801,7 @@ impl AppWindow {
             "terminal" | "终端" | "shell" | "zsh" | "bash" | "sh" | "fish" | "nu" | "nushell" | "dash"
                 | "pwsh" | "powershell" | "powershell 7" | "windows powershell" | "cmd" | "command prompt"
                 | "git bash" | "wsl" | "dos prompt" | "headless"
-                | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "antigravity" | "agy" | "agy.real"
+                | "claude" | "claude code" | "claude-code" | "codex" | "antigravity" | "agy" | "agy.real"
                 | "opencode" | "cursor" | "cursor-agent" | "pi" | "pig" | "qwen" | "kimi" | "kimi-code"
                 | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot" | "amp" | "grok"
                 | "hermes" | "goose" | "crush" | "omp" | "oh-my-pi" | "dsh" | "dsh-tui" | "deepseek"
@@ -8350,7 +8537,6 @@ impl AppWindow {
         match raw.trim() {
             "claude-code" => "claude",
             "cursor-agent" => "cursor",
-            "gemini-cli" => "gemini",
             "qwen-code" => "qwen",
             "kiro-cli" => "kiro",
             "antigravity-cli" | "agy" | "agy.real" => "antigravity",
@@ -8567,7 +8753,7 @@ impl AppWindow {
         if is_acp {
             let is_builtin = matches!(
                 prog_key.as_str(),
-                "claude" | "codex" | "gemini" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose" | "zcode" | "trae"
+                "claude" | "codex" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose" | "zcode" | "trae"
             );
             let mut params = json!({ "keep": true });
             if is_builtin {
@@ -9725,8 +9911,6 @@ impl AppWindow {
                 let Some(rec) = self.live.get(&t) else {
                     return self.fail(format!("no running terminal {t:?}"));
                 };
-                let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-                let rep_state = rec.pointer("/report/state").and_then(Value::as_str).map(str::to_owned);
                 let app = rec
                     .pointer("/report/app")
                     .and_then(Value::as_str)
@@ -9735,15 +9919,22 @@ impl AppWindow {
                     .or_else(|| rec.pointer("/program/key").and_then(Value::as_str))
                     .map(str::to_owned);
                 let next_owned = next.map(str::to_owned);
+                self.release_blocked_hold(&t);
                 self.manual_statuses.insert(t.clone(), ManualStatus {
                     status: next_owned.clone(),
-                    turn,
-                    reported_state: rep_state,
                     set_at: Instant::now(),
                     label_synced: next.is_none(),
                 });
+                if next.is_some() {
+                    self.ai_terminal_states.remove(&t);
+                    self.pending_ai_alerts.retain(|(a, _)| a != &t);
+                }
                 if let Some(obj) = self.live.get_mut(&t).and_then(Value::as_object_mut) {
                     obj.insert("manual_status".into(), next.map_or(Value::Null, |s| json!(s)));
+                    if next.is_some() {
+                        obj.insert("ai_status_summary".into(), Value::Null);
+                        obj.insert("ai_status_kind".into(), Value::Null);
+                    }
                 }
                 self.model.set_manual_status(&t, next_owned, app.clone());
                 if next.is_none() {
@@ -9766,7 +9957,7 @@ impl AppWindow {
                     self.core.clone(),
                     t,
                     "herdr.status",
-                    next.map_or_else(String::new, |s| format!("{s}@{turn}")),
+                    next.map_or_else(String::new, str::to_owned),
                     cx,
                 );
             }
@@ -10106,6 +10297,7 @@ impl AppWindow {
                                             "level": "info",
                                             "action": { "name": "agent.focus", "args": { "terminal": target } },
                                         });
+                                        this.release_blocked_hold(&target);
                                         this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
                                         if let Some(ref ov_id) = close_ov {
                                             this.close_overlay(ov_id, window, cx);
@@ -10241,6 +10433,7 @@ impl AppWindow {
                 if focus {
                     self.dispatch("agent.focus", &json!({ "terminal": target }), false, window, cx);
                 }
+                self.release_blocked_hold(&target);
                 let core = self.core.clone();
                 let generation = self.core_generation;
                 let target_for_ui = target.clone();
@@ -10396,6 +10589,7 @@ impl AppWindow {
                                         "level": "success",
                                         "action": { "name": "agent.focus", "args": { "terminal": resolved_target } },
                                     });
+                                    this.release_blocked_hold(&resolved_target);
                                     this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
                                     if focus_after {
                                         this.dispatch("agent.focus", &json!({ "terminal": resolved_target }), false, window, cx);
@@ -13263,6 +13457,7 @@ impl Render for AppWindow {
                         && (is_acp_addr(&addr) || this.pane_is_structured(&pane))
                         && this.model.status(&addr) == Some("working")
                     {
+                        this.release_blocked_hold(&addr);
                         let core = this.core.clone();
                         cx.background_executor()
                             .spawn(async move {
@@ -16774,5 +16969,55 @@ export default class SystemToast extends View {
             "fullProbe": true,
             "agents": [{ "id": "claude", "installed": false, "models": [] }]
         })));
+    }
+
+    #[test]
+    fn blocked_hold_stays_locked_across_passive_events_and_releases_on_user_conversation() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(50);
+
+        // 1. PTY agent latched as blocked: passive focus/resize/redraw (same typed_at & turn) MUST NOT release.
+        let pty_hold = super::BlockedHold {
+            ai_kind: Some("question".into()),
+            ai_summary: Some("Confirm deploy?".into()),
+            latched_typed_at: Some(t0),
+            latched_turn: 3,
+            had_pending_permission: false,
+            is_acp: false,
+        };
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 3, false, Some("idle")));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, None, 3, false, Some("working")));
+        // User types/responds in terminal -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t1), 3, false, Some("idle")));
+        // User sends a new turn (e.g. via Peek / h2 send) -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t0), 4, false, Some("idle")));
+        // User manually changes status -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, true, Some(t0), 3, false, Some("blocked")));
+
+        // 2. PTY agent latched before any keystroke (latched_typed_at == None): first keystroke releases.
+        let pty_fresh = super::BlockedHold {
+            ai_kind: None,
+            ai_summary: None,
+            latched_typed_at: None,
+            latched_turn: 0,
+            had_pending_permission: false,
+            is_acp: false,
+        };
+        assert!(!super::should_release_blocked_hold(&pty_fresh, false, None, 0, false, None));
+        assert!(super::should_release_blocked_hold(&pty_fresh, false, Some(t0), 0, false, None));
+
+        // 3. ACP agent latched on pending permission: stays locked while pending, releases on approve/deny or working.
+        let acp_hold = super::BlockedHold {
+            ai_kind: None,
+            ai_summary: None,
+            latched_typed_at: None,
+            latched_turn: 2,
+            had_pending_permission: true,
+            is_acp: true,
+        };
+        assert!(!super::should_release_blocked_hold(&acp_hold, false, None, 2, true, Some("blocked")));
+        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 2, false, Some("working")));
+        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 2, true, Some("working")));
+        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 3, true, Some("blocked")));
     }
 }

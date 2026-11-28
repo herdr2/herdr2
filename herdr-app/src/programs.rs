@@ -62,7 +62,7 @@ impl Entry {
 }
 
 /// The agents people pick most, first in menus; the rest follow by name.
-const AGENTS_FIRST: &[&str] = &["claude", "codex", "antigravity", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode", "trae"];
+const AGENTS_FIRST: &[&str] = &["claude", "codex", "antigravity", "pi", "opencode", "cursor", "copilot", "amp", "grok", "kimi", "qwen", "hermes", "glm", "zcode", "trae"];
 
 /// Every agent the table can start (entries with `run`), most picked first:
 /// `{ key, name, icon, tint, tile, color, run }`.
@@ -108,6 +108,26 @@ pub fn installed(commands: &[String], on: Option<&str>) -> Result<Vec<String>, S
     installed_result(commands, result)
 }
 
+fn is_ide_shim_str(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains(".windsurf") || lower.contains(".codeium") {
+        return true;
+    }
+    lower.split(['/', '\\']).any(|seg| seg == "copilot-shim")
+}
+
+fn is_ide_shim_candidate(path: &std::path::Path) -> bool {
+    if is_ide_shim_str(&path.to_string_lossy()) {
+        return true;
+    }
+    if let Ok(link) = std::fs::read_link(path)
+        && is_ide_shim_str(&link.to_string_lossy())
+    {
+        return true;
+    }
+    path.canonicalize().ok().is_some_and(|resolved| is_ide_shim_str(&resolved.to_string_lossy()))
+}
+
 fn installed_windows_path(commands: &[String]) -> Vec<String> {
     let path_env = std::env::var_os("PATH").unwrap_or_default();
     let exts: Vec<String> = std::env::var("PATHEXT")
@@ -117,25 +137,26 @@ fn installed_windows_path(commands: &[String]) -> Vec<String> {
         .map(str::to_owned)
         .collect();
     let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path_env).collect();
+    let is_real_file = |p: &std::path::Path| p.is_file() && !is_ide_shim_candidate(p);
     commands
         .iter()
         .filter(|cmd| {
             let p = std::path::Path::new(cmd.as_str());
             if p.components().count() > 1 || p.is_absolute() {
-                if p.extension().is_some() && p.is_file() {
+                if p.extension().is_some() && is_real_file(p) {
                     return true;
                 }
                 return exts
                     .iter()
-                    .any(|ext| std::path::PathBuf::from(format!("{}{ext}", p.display())).is_file());
+                    .any(|ext| is_real_file(&std::path::PathBuf::from(format!("{}{ext}", p.display()))));
             }
             dirs.iter().any(|dir| {
                 let candidate = dir.join(cmd.as_str());
-                if candidate.extension().is_some() && candidate.is_file() {
+                if candidate.extension().is_some() && is_real_file(&candidate) {
                     return true;
                 }
                 exts.iter()
-                    .any(|ext| std::path::PathBuf::from(format!("{}{ext}", candidate.display())).is_file())
+                    .any(|ext| is_real_file(&std::path::PathBuf::from(format!("{}{ext}", candidate.display()))))
             })
         })
         .cloned()
@@ -168,23 +189,40 @@ fn installed_result(commands: &[String], result: Result<(i32, String, String), S
 fn installed_powershell(commands: &[String]) -> Vec<String> {
     let list = commands.iter().map(|c| powershell_quote(c)).collect::<Vec<_>>().join(",");
     let script = format!(
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); foreach($c in @({list})){{ if(Get-Command $c -ErrorAction SilentlyContinue){{ \"herdr-has:$c\" }} }}; \"herdr-check-complete\""
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); foreach($c in @({list})){{ $hits = @(Get-Command $c -All -ErrorAction SilentlyContinue | Where-Object {{ $s = \"$($_.Source) $($_.Target)\"; $s -notmatch '(?i)((^|[\\\\/])copilot-shim([\\\\/]|$)|\\.windsurf|\\.codeium)' }}); if($hits.Count -gt 0){{ \"herdr-has:$c\" }} }}; \"herdr-check-complete\""
     );
     vec!["-NoLogo".into(), "-Command".into(), script]
 }
 
-/// Check in the shell itself for functions, but not aliases (`"$@"` cannot run them).
+/// Check in the shell itself for functions, but not aliases (`"$@"` cannot run them),
+/// and skip IDE placeholder shims such as VS Code's `copilot-shim` or Windsurf/Codeium wrappers.
 fn installed_line(commands: &[String], fish: bool) -> String {
+    if fish {
+        let checks = commands
+            .iter()
+            .map(|c| {
+                let word = format!("'{}'", c.replace('\'', "'\\''"));
+                format!(
+                    "if _herdr_has {word}; printf 'herdr-has:%s\\n' {word}; end;"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!(
+            "function _herdr_shim; set -l rp (readlink -f -- $argv[1] 2>/dev/null; or readlink -- $argv[1] 2>/dev/null; or echo $argv[1]); string match -qi -r '(/copilot-shim/|\\.windsurf|\\.codeium)' -- \"/$argv[1]/|/$rp/\"; end; function _herdr_has; if functions -q -- $argv[1]; return 0; end; for p in (type -aP -- $argv[1] 2>/dev/null); if not _herdr_shim $p; return 0; end; end; return 1; end; {checks} printf '\\nherdr-check-complete\\n'"
+        );
+    }
     let checks = commands
         .iter()
         .map(|c| {
             let word = format!("'{}'", c.replace('\'', "'\\''"));
-            let unalias = if fish { String::new() } else { format!("unalias -- {word} 2>/dev/null; ") };
-            format!("{unalias}command -v {word} >/dev/null 2>&1 && printf 'herdr-has:%s\\n' {word};")
+            format!("_herdr_has {word} && printf 'herdr-has:%s\\n' {word};")
         })
         .collect::<Vec<_>>()
         .join(" ");
-    format!("{checks} printf '\\nherdr-check-complete\\n'")
+    format!(
+        "_herdr_shim() {{ _rp=$(readlink -f \"$1\" 2>/dev/null || readlink \"$1\" 2>/dev/null || printf '%s' \"$1\"); case \"/$1/|/$_rp/\" in */copilot-shim/*|*/COPILOT-SHIM/*|*.windsurf*|*.codeium*) return 0 ;; esac; return 1; }}; _herdr_has() {{ unalias -- \"$1\" 2>/dev/null; _p=$(command -v -- \"$1\" 2>/dev/null) || return 1; case \"$_p\" in /*) _herdr_shim \"$_p\" || return 0 ;; *) return 0 ;; esac; _rest=$PATH:; while [ -n \"$_rest\" ]; do _d=${{_rest%%:*}}; _rest=${{_rest#*:}}; [ -n \"$_d\" ] || _d=.; if [ -f \"$_d/$1\" ] && [ -x \"$_d/$1\" ] && ! _herdr_shim \"$_d/$1\"; then return 0; fi; done; return 1; }}; {checks} printf '\\nherdr-check-complete\\n'"
+    )
 }
 
 thread_local! {
@@ -649,7 +687,7 @@ mod tests {
         assert!(startable().iter().any(|a| a["key"] == "claude" && a["run"] == json!(["claude", "--dangerously-skip-permissions"])));
         assert!(startable().iter().any(|a| a["key"] == "codex" && a["run"] == json!(["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"])));
         assert!(startable().iter().any(|a| a["key"] == "opencode" && a["run"] == json!(["opencode", "--auto"])));
-        assert!(startable().iter().any(|a| a["key"] == "gemini" && a["run"] == json!(["gemini", "--yolo"])));
+        assert!(!startable().iter().any(|a| a["key"] == "gemini"));
         // A person's own key still beats a built-in `match` (python matches python3).
         let mut personal = t();
         personal.programs.insert(
@@ -696,7 +734,6 @@ mod tests {
         assert_eq!(key(None, &["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]), "claude");
         assert!(is_agent(&["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]));
         assert_eq!(key(None, &[r"C:\Program Files\nodejs\node.exe", r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js"]), "codex");
-        assert_eq!(key(None, &["node", "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js"]), "gemini");
         assert_eq!(key(None, &["/home/u/.local/share/claude/versions/2.1.325"]), "claude");
         assert!(is_agent(&["/home/u/.local/share/claude/versions/2.1.325"]));
         assert_eq!(
@@ -762,6 +799,59 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(installed_result(&commands, Ok((0, String::from_utf8(out.stdout).unwrap(), String::new()))).unwrap(), ["issue57_function", "printf"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_skips_vscode_copilot_shim_and_finds_real_copilot_later_on_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = if cfg!(target_os = "linux") { std::path::PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let dir = temp.join(format!("herdr-copilot-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("share/code/bin/copilot-shim");
+        let usr_bin = dir.join("usr/bin");
+        let real_bin = dir.join("local/bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&usr_bin).unwrap();
+        std::fs::create_dir_all(&real_bin).unwrap();
+
+        let shim_bin = shim_dir.join("copilot");
+        std::fs::write(&shim_bin, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&shim_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&shim_bin, usr_bin.join("copilot")).unwrap();
+
+        let commands = ["copilot".to_string()];
+        let line = installed_line(&commands, false);
+
+        // Shim-only PATH: copilot must NOT be reported as installed.
+        let out_shim_only = std::process::Command::new("sh")
+            .args(["-c", &line])
+            .env("PATH", format!("{}:/usr/bin:/bin", usr_bin.display()))
+            .output()
+            .unwrap();
+        assert!(out_shim_only.status.success());
+        assert_eq!(
+            installed_result(&commands, Ok((0, String::from_utf8(out_shim_only.stdout).unwrap(), String::new()))).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Real copilot later on PATH: must skip the shim and detect the real binary.
+        let real_copilot = real_bin.join("copilot");
+        std::fs::write(&real_copilot, "#!/bin/sh\necho real\n").unwrap();
+        std::fs::set_permissions(&real_copilot, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out_with_real = std::process::Command::new("sh")
+            .args(["-c", &line])
+            .env("PATH", format!("{}:{}:/usr/bin:/bin", usr_bin.display(), real_bin.display()))
+            .output()
+            .unwrap();
+        assert!(out_with_real.status.success());
+        assert_eq!(
+            installed_result(&commands, Ok((0, String::from_utf8(out_with_real.stdout).unwrap(), String::new()))).unwrap(),
+            vec!["copilot".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

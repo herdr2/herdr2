@@ -61,8 +61,6 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
 
             let sender = p.caller.as_deref();
             let sent = core.send(id, &delivery_text, p.steer, None, sender).await?;
-            core.clear_manual_status_key(TargetKey::Agent(id));
-            core.clear_manual_status_caller(sender);
             core.saw(sender, id);
             core.flush_saved().await?;
 
@@ -93,8 +91,6 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
 
             let sender = p.caller.as_deref();
             let sent = core.pty_send(id, &pointer, p.steer, None).await?;
-            core.clear_manual_status_key(TargetKey::Terminal(id));
-            core.clear_manual_status_caller(sender);
             core.pty_saw(sender, id);
             core.flush_saved().await?;
 

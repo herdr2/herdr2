@@ -1642,7 +1642,6 @@ pub(crate) fn same_acp_adapter_family(a: &str, b: &str) -> bool {
         "antigravity" | "antigravity-cli" => "agy".to_string(),
         "cursor-agent" => "cursor".to_string(),
         "claude-code" => "claude".to_string(),
-        "gemini-cli" => "gemini".to_string(),
         other => other.to_string(),
     };
     canon(a) == canon(b)

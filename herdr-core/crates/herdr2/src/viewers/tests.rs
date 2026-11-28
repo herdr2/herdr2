@@ -93,7 +93,7 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
 }
 
 #[test]
-fn viewer_input_clears_manual_status_only_on_real_interaction() {
+fn viewer_input_preserves_manual_status_override() {
     assert!(!is_user_interaction_input(b""));
     assert!(!is_user_interaction_input(b"\x1b[I"));
     assert!(!is_user_interaction_input(b"\x1b[O"));
@@ -150,9 +150,9 @@ fn viewer_input_clears_manual_status_only_on_real_interaction() {
     core.viewer_input(&conn, channel, b"y", true);
     assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
 
-    // User keystroke clears herdr.status back to auto.
-    core.viewer_input(&conn, channel, b"y", false);
-    assert!(!core.lock().pty_reg.terminals[&id].labels.contains_key("herdr.status"));
+    // Real user keystrokes must also preserve an explicit manual status until the user resets it to auto.
+    core.viewer_input(&conn, channel, b"y\r", false);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
 
     drop(core);
     std::fs::remove_dir_all(root).unwrap();

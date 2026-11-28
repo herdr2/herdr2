@@ -553,7 +553,6 @@ fn is_placeholder_text(candidate: &str) -> bool {
         "ask anything",
         "ask claude",
         "ask codex",
-        "ask gemini",
         "ask opencode",
         "ask a question",
         "type your",

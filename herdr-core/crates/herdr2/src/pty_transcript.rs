@@ -1,5 +1,5 @@
 //! Structured transcript extraction for terminal-hosted coding agents (Claude Code,
-//! Codex CLI, Cursor CLI, Gemini CLI, Qwen Code, Pi / oh-my-pi, and Antigravity CLI)
+//! Codex CLI, Cursor CLI, Qwen Code, Pi / oh-my-pi, and Antigravity CLI)
 //! plus optimistic merging of prompts sent via `h2 send`.
 
 use crate::acp::proto::AcpContextUsage;
@@ -41,7 +41,6 @@ enum Provider {
     Claude,
     Codex,
     Cursor,
-    Gemini,
     Qwen,
     Pi,
     Agy,
@@ -53,7 +52,6 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Cursor => "cursor",
-            Provider::Gemini => "gemini",
             Provider::Qwen => "qwen",
             Provider::Pi => "pi",
             Provider::Agy => "agy",
@@ -120,7 +118,7 @@ fn candidate_session_id(c: &Candidate) -> Option<String> {
             .map(str::to_string),
         Provider::Codex => codex_sid_from_header(&c.path),
         Provider::Agy => agy_cid_from_path(&c.path),
-        Provider::Gemini | Provider::Pi => None,
+        Provider::Pi => None,
     }
 }
 
@@ -345,7 +343,6 @@ fn extract_transcript_with_home(
                 &norm_cwd,
                 if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
             ),
-            Provider::Gemini => discover_gemini_or_qwen(home, ".gemini", Provider::Gemini, &norm_cwd, min_mtime),
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
             Provider::Agy => {
@@ -386,7 +383,6 @@ fn extract_transcript_with_home(
                 Provider::Claude => parse_claude_jsonl(&best.path),
                 Provider::Codex => parse_codex_jsonl(&best.path),
                 Provider::Cursor => parse_cursor_jsonl(&best.path),
-                Provider::Gemini => parse_gemini_json(&best.path),
                 Provider::Qwen => {
                     if best.path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
                         parse_claude_jsonl(&best.path)
@@ -415,7 +411,6 @@ fn ordered_providers(hint: Option<&str>) -> Vec<Provider> {
         Some("claude") => vec![Provider::Claude],
         Some("codex") => vec![Provider::Codex],
         Some("cursor") => vec![Provider::Cursor],
-        Some("gemini") => vec![Provider::Gemini],
         Some("qwen") => vec![Provider::Qwen],
         Some("pi") => vec![Provider::Pi],
         Some("agy") => vec![Provider::Agy],
@@ -436,9 +431,6 @@ fn hint_from_label(raw: &str) -> Option<&'static str> {
     }
     if lower == "cursor" || lower == "cursor-agent" || lower == "cursor agent" {
         return Some("cursor");
-    }
-    if lower == "gemini" || lower == "gemini-cli" {
-        return Some("gemini");
     }
     if lower == "qwen" || lower == "qwen-code" {
         return Some("qwen");
@@ -3740,19 +3732,19 @@ mod tests {
     }
 
     #[test]
-    fn extracts_gemini_session_json() {
-        let root = tmp_dir("gemini");
-        let project = "/tmp/gemini/proj";
-        let chats = root.join(".gemini/tmp/hash123/chats");
+    fn extracts_qwen_legacy_session_json() {
+        let root = tmp_dir("qwen-legacy");
+        let project = "/tmp/qwen-legacy/proj";
+        let chats = root.join(".qwen/tmp/hash123/chats");
         fs::create_dir_all(&chats).unwrap();
-        fs::write(root.join(".gemini/tmp/hash123/.project_root"), project).unwrap();
+        fs::write(root.join(".qwen/tmp/hash123/.project_root"), project).unwrap();
         let session = chats.join("session-2026-11-17T10-00-00.json");
         let payload = serde_json::json!({
             "startTime": "2026-11-17T10:00:00.000Z",
             "messages": [
                 { "type": "user", "timestamp": "2026-11-17T10:00:01.000Z", "content": "Explain lib.rs" },
                 {
-                    "type": "gemini",
+                    "type": "assistant",
                     "timestamp": "2026-11-17T10:00:02.000Z",
                     "thoughts": [{ "subject": "Reading", "description": "Check exports" }],
                     "toolCalls": [{ "id": "g1", "name": "read_file", "args": { "path": "src/lib.rs" }, "status": "success" }],
@@ -3765,7 +3757,7 @@ mod tests {
         let snap = PtySnapshot {
             cwd: project.to_string(),
             started_ms: parse_ts_ms("2026-11-17T10:00:00.000Z"),
-            agent_hint: Some("gemini".into()),
+            agent_hint: Some("qwen".into()),
             sent_prompts: Vec::new(),
             turn: 1,
             resumed: false,

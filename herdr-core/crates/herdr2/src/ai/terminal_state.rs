@@ -23,7 +23,7 @@ pub struct ClassifyTerminalStateParams {
     /// Target machine (`--on`). Omit for local core (recommended for local VT arbitration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
-    /// Detected interactive CLI program key (e.g. `claude`, `codex`, `gemini`, `opencode`).
+    /// Detected interactive CLI program key (e.g. `claude`, `codex`, `agy`, `opencode`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
     /// Raw terminal window title (preserving spinners / status markers).

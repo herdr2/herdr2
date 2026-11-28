@@ -15,7 +15,7 @@ h2 read lead --last
 
 Without `--bg`, `h2 run` waits for the first ACP turn to settle (default 180s check-in, exit 124 if still running while leaving the agent live).
 
-Built-in `--agent` presets: `claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, custom `[agents]` tables in `~/.config/herdr2/config.toml`, or explicit command lines (`h2 run --agent "python3 my_acp.py"`).
+Built-in `--agent` presets: `agy`, `claude`, `codex`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, custom `[agents]` tables in `~/.config/herdr2/config.toml`, or explicit command lines (`h2 run --agent "python3 my_acp.py"`).
 
 Non-agent commands run via `exec`:
 

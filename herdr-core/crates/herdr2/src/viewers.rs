@@ -366,9 +366,6 @@ impl Core {
             self.touch(&mut st, conn, channel, |_| {})
         };
         if let Some(id) = id {
-            if !automatic && is_user_interaction_input(bytes) {
-                self.clear_manual_status_pty_locked(&mut st, id);
-            }
             let answered = Self::viewer(&mut st, conn, channel).unwrap().1.answers.feed(bytes);
             let mut now = Vec::new();
             let mut from = 0;
@@ -541,10 +538,12 @@ fn ordered_replies(gate: &mut crate::pty_input::Gate, replies: &[u8]) -> Vec<u8>
 
 /// Returns true if `bytes` contains genuine user interaction (keystrokes, clicks, pastes)
 /// rather than passive focus/hover/wheel events.
+#[cfg(test)]
 pub(crate) fn is_user_interaction_input(bytes: &[u8]) -> bool {
     !bytes.is_empty() && !is_passive_mouse_or_focus_only(bytes)
 }
 
+#[cfg(test)]
 fn is_passive_mouse_or_focus_only(mut rest: &[u8]) -> bool {
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix(b"\x1b[I").or_else(|| rest.strip_prefix(b"\x1b[O")) {

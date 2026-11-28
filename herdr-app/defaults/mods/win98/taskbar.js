@@ -18,7 +18,6 @@ const AGENTS = [
   ["pi", "Pi", "icons/pi.svg"],
   ["opencode", "OpenCode", "icons/opencode.svg"],
   ["amp", "Amp", "icons/amp.svg"],
-  ["gemini", "Gemini", "icons/gemini.svg"],
   ["agent", "Cursor", "icons/cursor.svg"],
   ["copilot", "Copilot", "icons/copilot.svg"],
   ["grok", "Grok", "icons/grok.svg"],

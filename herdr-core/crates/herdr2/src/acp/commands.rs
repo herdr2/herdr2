@@ -46,7 +46,6 @@ pub fn detect_agent_kind(preset: Option<&str>, argv: &[String], app_hint: Option
             "claude" | "claude-code" | "claude-agent-acp" => return "claude".into(),
             "codex" | "codex-acp" => return "codex".into(),
             "agy" | "antigravity" | "antigravity-cli" => return "agy".into(),
-            "gemini" | "gemini-cli" => return "gemini".into(),
             "opencode" => return "opencode".into(),
             "cursor" | "cursor-agent" => return "cursor".into(),
             "copilot" => return "copilot".into(),
@@ -78,8 +77,6 @@ fn normalize_kind_token(raw: &str) -> String {
         "codex".into()
     } else if lower == "agy" || lower.contains("antigravity") {
         "agy".into()
-    } else if lower.contains("gemini") {
-        "gemini".into()
     } else if lower.contains("cursor") {
         "cursor".into()
     } else if lower.contains("opencode") {
@@ -272,20 +269,6 @@ fn builtin_commands_for(kind: &str) -> Vec<AcpAvailableCommand> {
             cmd("status", "Show current session status", None),
             cmd("help", "Show available commands", None),
         ],
-        "gemini" => vec![
-            cmd("help", "Display help on available commands", None),
-            cmd("clear", "Clear the screen and conversation history", None),
-            cmd("compress", "Compress chat context to save tokens", None),
-            cmd("chat", "Save, resume, or list conversation checkpoints", Some("[save|resume|list]")),
-            cmd("memory", "Manage GEMINI.md instructional context", Some("[show|refresh|add]")),
-            cmd("mcp", "List configured MCP servers and tools", None),
-            cmd("tools", "List available Gemini CLI tools", None),
-            cmd("stats", "Check session token and model statistics", None),
-            cmd("model", "Switch active Gemini model", Some("[model]")),
-            cmd("init", "Analyze the project and create a GEMINI.md file", None),
-            cmd("restore", "Restore project files to a previous checkpoint", None),
-            cmd("settings", "View and edit Gemini CLI settings", None),
-        ],
         "opencode" => vec![
             cmd("help", "Show available commands", None),
             cmd("clear", "Start a new session", None),
@@ -347,7 +330,7 @@ fn command_dirs_for(kind: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf>
                 push_dir(&mut dirs, h.join(".codex/prompts"));
             }
         }
-        "agy" | "gemini" => {
+        "agy" => {
             if has_cwd {
                 push_dir(&mut dirs, cwd.join(".gemini/commands"));
             }
@@ -408,7 +391,7 @@ fn skill_dirs_for(kind: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
                 push_dir(&mut dirs, h.join(".agents/skills"));
             }
         }
-        "agy" | "gemini" => {
+        "agy" => {
             if has_cwd {
                 push_dir(&mut dirs, cwd.join(".gemini/skills"));
                 push_dir(&mut dirs, cwd.join(".agents/skills"));

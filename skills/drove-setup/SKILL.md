@@ -12,7 +12,7 @@ In `herdr2`, Drove configuration lives in **`Herdr2 App -> Settings -> Drove`** 
 
 Ask the user to open **`Herdr2 App -> Settings -> Drove`** (or trigger `app.settings {"section":"drove"}`):
 1. **Target Machine**: Select `This computer` or any configured SSH machine.
-2. **Refresh Agents**: Click **Refresh Agents** (`h2 drove probe --refresh`) to discover installed ACP CLIs (`agy`, `claude`, `codex`, `gemini`, `opencode`, `qwen`, `dsh`) and their live model/effort options.
+2. **Refresh Agents**: Click **Refresh Agents** (`h2 drove probe --refresh`) to discover installed ACP CLIs (`agy`, `claude`, `codex`, `opencode`, `qwen`, `dsh`) and their live model/effort options.
 3. **Roles**: Assign `Agent`, `Model`, `Thinking Effort` (`low` / `medium` / `high` / `xhigh`), optional `Strengths`, and optional global / per-candidate `Note` (`note`, e.g., time-window or quota-cost avoidance rules read by AI when selecting/launching sub-agents) plus optional Fallback per Role (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, or custom roles).
 4. **AI Assistant (Optional)**: Enter `Service URL` + `API Key` (`0600` in `secrets/ai.key`), click **Save**, then **Test Connection**.
 5. **Magpie Quota (Optional)**: Disabled by default; toggle ON only if using a local Magpie gateway.

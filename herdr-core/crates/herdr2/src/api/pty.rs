@@ -337,8 +337,6 @@ pub(super) async fn terminal_send(core: Ctx<'_>, p: TerminalSendParams) -> Resul
     }
     let text = core.pty_tagged(p.caller.as_deref(), id, &p.text, false);
     let sent = core.pty_send(id, &text, p.force, p.only_if.map(|w| word(&w)).as_deref()).await?;
-    core.clear_manual_status_key(TargetKey::Terminal(id));
-    core.clear_manual_status_caller(p.caller.as_deref());
     let target_addr = crate::terminals::address(id);
     if let Some(caller_key) = p.caller.as_deref().and_then(TargetKey::parse) {
         let mut st = core.lock();
@@ -426,8 +424,6 @@ pub(super) async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysRe
         )));
     }
     let (status, turn) = core.keys(id, &p.keys).await?;
-    core.clear_manual_status_key(TargetKey::Terminal(id));
-    core.clear_manual_status_caller(p.caller.as_deref());
     core.pty_saw(p.caller.as_deref(), id);
     core.flush_saved().await?;
     Ok(KeysResult { status, turn })
@@ -441,7 +437,6 @@ pub(super) async fn terminal_interrupt(
     let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
     let id = resolve_pty(core, &p.terminal)?;
     let (outcome, key) = core.pty_interrupt(id, timeout).await?;
-    core.clear_manual_status_key(TargetKey::Terminal(id));
     let outcome = match outcome {
         Interrupted::Stopped => "stopped",
         Interrupted::Exited => "exited",

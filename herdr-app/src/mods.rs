@@ -7,11 +7,11 @@ use gpui_shell::{Capabilities, ExecuteGrant, HostError, HostModule, HostObject, 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 include!(concat!(env!("OUT_DIR"), "/default_mods.rs"));
@@ -1013,6 +1013,53 @@ fn exec_limit(options: Option<&HostValue>) -> Result<Duration, HostError> {
     }
 }
 
+static INTERACTED_AGENTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Drains agent/terminal addresses that JS mods explicitly conversed with via `h2(...)`
+/// (e.g. `h2 send`, `h2 approve`, `h2 deny`, `h2 keys`, `h2 interrupt`, `h2 inbox send`).
+pub fn take_interacted_agents() -> Vec<String> {
+    let mut guard = INTERACTED_AGENTS.lock().unwrap();
+    if guard.is_empty() {
+        return Vec::new();
+    }
+    guard.drain().collect()
+}
+
+fn h2_interaction_target(args: &[String]) -> Option<String> {
+    let first = args.first()?.as_str();
+    let start_idx = match first {
+        "send" | "approve" | "deny" | "keys" | "interrupt" => 1,
+        "inbox" if args.get(1).map(String::as_str) == Some("send") => 2,
+        _ => return None,
+    };
+    let mut i = start_idx;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(flag) = a.strip_prefix("--") {
+            if !flag.contains('=')
+                && matches!(
+                    flag,
+                    "option" | "on" | "file" | "timeout" | "only-if" | "from" | "caller" | "image" | "attach" | "model"
+                )
+            {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            i += 1;
+            continue;
+        }
+        return Some(a.to_owned());
+    }
+    None
+}
+
 pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, limit: Duration) -> Result<(i32, String, String), String> {
     use std::io::Read;
     // Shipped/custom mods may call either `hc(...)` or `h2(...)`; both use the resolved herdr2 core.
@@ -1061,7 +1108,14 @@ pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, 
             Err(e) => return Err(e.to_string()),
         }
     };
-    Ok((status.code().unwrap_or(-1), out.join().unwrap_or_default(), err.join().unwrap_or_default()))
+    let code = status.code().unwrap_or(-1);
+    if is_core
+        && code == 0
+        && let Some(target) = h2_interaction_target(args)
+    {
+        INTERACTED_AGENTS.lock().unwrap().insert(target);
+    }
+    Ok((code, out.join().unwrap_or_default(), err.join().unwrap_or_default()))
 }
 
 /// Runs a program on another machine through the core's exec: its exact output.
@@ -2457,5 +2511,19 @@ mod tests {
         assert!(!home.join("mods/pane/extra.js").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn h2_interaction_target_extracts_conversation_commands_and_ignores_reads() {
+        let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(h2_interaction_target(&v(&["send", "--json", "t1", "hello"])), Some("t1".into()));
+        assert_eq!(h2_interaction_target(&v(&["approve", "--json", "--option", "allow", "a1"])), Some("a1".into()));
+        assert_eq!(h2_interaction_target(&v(&["deny", "--json", "a2"])), Some("a2".into()));
+        assert_eq!(h2_interaction_target(&v(&["interrupt", "--json", "box/t3"])), Some("box/t3".into()));
+        assert_eq!(h2_interaction_target(&v(&["keys", "--json", "t4", "enter"])), Some("t4".into()));
+        assert_eq!(h2_interaction_target(&v(&["inbox", "send", "--json", "a5", "101"])), Some("a5".into()));
+        assert_eq!(h2_interaction_target(&v(&["read", "--json", "t1"])), None);
+        assert_eq!(h2_interaction_target(&v(&["get", "--json", "a1"])), None);
+        assert_eq!(h2_interaction_target(&v(&["ls", "--json"])), None);
     }
 }

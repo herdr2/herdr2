@@ -198,7 +198,6 @@ pub fn default_pty_argv(preset: &str) -> Vec<String> {
             vec!["claude".into(), "--dangerously-skip-permissions".into()]
         }
         "codex" => vec!["codex".into(), "--no-daemon".into(), "--dangerously-bypass-approvals-and-sandbox".into()],
-        "gemini" | "gemini-cli" => vec!["gemini".into(), "--yolo".into()],
         "agy" | "antigravity" | "antigravity-cli" => {
             vec!["agy".into(), "--dangerously-skip-permissions".into()]
         }

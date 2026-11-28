@@ -10,7 +10,6 @@ export const ACP_PRESETS = new Set([
   "codex",
   "antigravity",
   "agy",
-  "gemini",
   "opencode",
   "copilot",
   "cursor",
@@ -82,13 +81,6 @@ const CURATED_AGENT_CATALOG = {
       "claude-opus-5-5": ["low", "medium", "high"],
       "claude-sonnet-5-5": ["low", "medium", "high"],
     },
-  },
-  gemini: {
-    rawModels: ["gemini-2.5-pro", "gemini-2.5-flash"],
-    defaultModel: "",
-    efforts: ["low", "medium", "high"],
-    defaultEffort: "",
-    modelEfforts: {},
   },
   cursor: {
     rawModels: ["auto", "claude-4.6-sonnet-thinking", "gpt-5.4", "gemini-2.5-pro"],

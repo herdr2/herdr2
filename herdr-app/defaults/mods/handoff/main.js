@@ -8,7 +8,7 @@ import { terminals, agents, panes, spaces, knownAgents, run, h2, props, closeOve
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 
-const ACP_PRESETS = ["claude", "codex", "gemini", "agy", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"];
+const ACP_PRESETS = ["claude", "codex", "agy", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"];
 const ACP_ALIAS = { antigravity: "agy" };
 
 const CREATE_MODES = () => [
@@ -77,7 +77,7 @@ function withAlpha(hex, alphaHex) {
 function providerPresetOf(rec) {
   if (!rec) return null;
   const raw = String(rec.agent || rec.program?.key || rec.report?.app || rec.template || "").toLowerCase();
-  for (const key of ["claude", "codex", "gemini", "agy", "antigravity", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"]) {
+  for (const key of ["claude", "codex", "agy", "antigravity", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"]) {
     if (raw.includes(key)) return ACP_ALIAS[key] ?? key;
   }
   return null;

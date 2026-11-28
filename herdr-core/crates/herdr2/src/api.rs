@@ -867,9 +867,6 @@ pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResul
             let sent = core
                 .send_with_attachments(id, &text, attachments, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender)
                 .await?;
-            core.clear_manual_status_key(TargetKey::Agent(id));
-            core.clear_manual_status_caller(p.from.as_deref());
-            core.clear_manual_status_caller(p.caller.as_deref());
             let target_addr = crate::agents::address(id);
             if let Some(caller_key) = sender.and_then(TargetKey::parse) {
                 let mut st = core.lock();
@@ -977,8 +974,6 @@ async fn agent_deny(core: Ctx<'_>, p: ApproveParams) -> Result<ApproveResult, Rp
 async fn resolve_perm(core: Ctx<'_>, p: ApproveParams, approve: bool) -> Result<ApproveResult, RpcError> {
     let id = resolve(core, &p.agent)?;
     let (request_id, option_id) = core.resolve_permission(id, approve, p.option.as_deref())?;
-    core.clear_manual_status_key(TargetKey::Agent(id));
-    core.clear_manual_status_caller(p.caller.as_deref());
     core.saw(p.caller.as_deref(), id);
     core.flush_saved().await?;
     let outcome = if approve { "approved" } else { "denied" }.into();
@@ -1008,7 +1003,6 @@ async fn agent_config(core: Ctx<'_>, p: ConfigParams) -> Result<Public, RpcError
     }
     let updated = {
         let mut st = core.lock();
-        core.clear_manual_status_agent_locked(&mut st, id);
         let (data, snapshot) = {
             let a = st.reg.agents.get(&id).ok_or_else(|| {
                 RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
@@ -1256,7 +1250,6 @@ async fn agent_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<InterruptR
             use crate::input::Interrupted;
             let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
             let (outcome, method) = core.interrupt(id, timeout).await?;
-            core.clear_manual_status_key(TargetKey::Agent(id));
             let outcome = match outcome {
                 Interrupted::Stopped => "stopped",
                 Interrupted::Exited => "exited",
@@ -1659,8 +1652,12 @@ async fn ai_briefing(core: Ctx<'_>, p: crate::ai::BriefingParams) -> Result<crat
                 }
                 let Some(addr) = rec["address"].as_str() else { continue };
                 let status = rec
-                    .pointer("/status/state")
+                    .pointer("/labels/herdr.status")
                     .and_then(serde_json::Value::as_str)
+                    .and_then(|s| s.split('@').next())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| rec.pointer("/status/state").and_then(serde_json::Value::as_str))
                     .or_else(|| rec["status"].as_str())
                     .unwrap_or("idle")
                     .to_string();

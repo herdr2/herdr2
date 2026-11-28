@@ -73,7 +73,7 @@ pub(crate) enum SkillAction {
         /// Only install into agents actually detected on disk/PATH (do not create fallback dirs).
         #[arg(long)]
         detected_only: bool,
-        /// Target a specific known agent ID (e.g. claude, codex, agy, cursor, gemini, opencode, hermes, zcode, trae, qoder, ...).
+        /// Target a specific known agent ID (e.g. claude, codex, agy, cursor, opencode, hermes, zcode, trae, qoder, ...).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Target a custom skills root directory.
@@ -155,15 +155,6 @@ const KNOWN_AGENTS: &[KnownAgentSpec] = &[
         markers: &[&[".cursor"]],
         skills_rel: &[".cursor", "skills"],
         shared_skills_dir: false,
-    },
-    KnownAgentSpec {
-        id: "gemini",
-        aliases: &[],
-        name: "Gemini CLI",
-        bins: &["gemini"],
-        markers: &[],
-        skills_rel: &[".gemini", "skills"],
-        shared_skills_dir: true,
     },
     KnownAgentSpec {
         id: "opencode",
@@ -429,7 +420,7 @@ fn has_command_in_dirs(bin: &str, dirs: &[PathBuf]) -> bool {
     for dir in dirs {
         for ext in &exts {
             let cand = dir.join(format!("{bin}{ext}"));
-            if cand.is_file() {
+            if cand.is_file() && !crate::acp::presets::is_ide_shim_candidate(&cand) {
                 return true;
             }
         }
@@ -1669,7 +1660,7 @@ mod tests {
     #[test]
     fn known_agents_align_with_supported_agents_and_preserve_antigravity_alias() {
         for id in [
-            "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi", "kimi", "copilot", "qwen",
+            "claude", "codex", "agy", "cursor", "opencode", "pi", "kimi", "copilot", "qwen",
             "hermes", "zcode", "trae", "glm", "dsh", "qoder", "kiro", "amp", "grok", "goose", "crush", "omp", "windsurf",
         ] {
             assert!(lookup_known_agent(id).is_some(), "missing known agent {id}");

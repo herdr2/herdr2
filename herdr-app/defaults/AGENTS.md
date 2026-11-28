@@ -718,7 +718,7 @@ What's about the user, never a look:
 { "zoom": 1, "sounds": { "enabled": true } }
 ```
 
-- `default_agent`: preset name (e.g. `"claude"`, `"codex"`, `"gemini"`) or binary used when starting a session without explicit `argv`.
+- `default_agent`: preset name (e.g. `"claude"`, `"codex"`, `"agy"`) or binary used when starting a session without explicit `argv`.
 - `zoom` scales the whole app: terminals, mods, the layout's px sizes
   (0.5 to 3; the zoom keys change it). Write sizes as designed at zoom 1.
 - `sounds`: `{ "enabled": true, "done": "<file>", "blocked": "<file>" }`.

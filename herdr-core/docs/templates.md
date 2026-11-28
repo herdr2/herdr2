@@ -41,7 +41,7 @@ Start and close frontmatter with `---` lines using simple `key: value` pairs (no
 
 | Field | Meaning |
 | --- | --- |
-| `agent` | ACP preset (`claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`) or custom command string (required unless `command` is set). |
+| `agent` | ACP preset (`agy`, `claude`, `codex`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`) or custom command string (required unless `command` is set). |
 | `command` | Alternative ACP command line if `agent` is omitted. |
 | `description` | Short description shown by `h2 templates`. |
 | `model` | Optional model passed to ACP `session/set_config_option` (`model`). |

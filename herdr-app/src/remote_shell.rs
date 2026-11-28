@@ -1,8 +1,9 @@
 //! The shell used to check and launch agents on another machine.
 
 pub fn check(commands: &[String]) -> Vec<String> {
-    let posix = "for c; do unalias -- \"$c\" 2>/dev/null; command -v \"$c\" >/dev/null 2>&1 && printf 'herdr-has:%s\\n' \"$c\"; done; printf '\\nherdr-check-complete\\n'";
-    in_shell(posix, "for c in $argv[2..]; command -v $c >/dev/null 2>&1; and printf 'herdr-has:%s\\n' $c; end; printf '\\nherdr-check-complete\\n'", posix, commands.to_vec())
+    let posix = "_herdr_shim() { _rp=$(readlink -f \"$1\" 2>/dev/null || readlink \"$1\" 2>/dev/null || printf '%s' \"$1\"); case \"/$1/|/$_rp/\" in */copilot-shim/*|*/COPILOT-SHIM/*|*.windsurf*|*.codeium*) return 0 ;; esac; return 1; }; _herdr_has() { unalias -- \"$1\" 2>/dev/null; _p=$(command -v -- \"$1\" 2>/dev/null) || return 1; case \"$_p\" in /*) _herdr_shim \"$_p\" || return 0 ;; *) return 0 ;; esac; _rest=$PATH:; while [ -n \"$_rest\" ]; do _d=${_rest%%:*}; _rest=${_rest#*:}; [ -n \"$_d\" ] || _d=.; if [ -f \"$_d/$1\" ] && [ -x \"$_d/$1\" ] && ! _herdr_shim \"$_d/$1\"; then return 0; fi; done; return 1; }; for c; do _herdr_has \"$c\" && printf 'herdr-has:%s\\n' \"$c\"; done; printf '\\nherdr-check-complete\\n'";
+    let fish = "function _herdr_shim; set -l rp (readlink -f -- $argv[1] 2>/dev/null; or readlink -- $argv[1] 2>/dev/null; or echo $argv[1]); string match -qi -r '(/copilot-shim/|\\.windsurf|\\.codeium)' -- \"/$argv[1]/|/$rp/\"; end; function _herdr_has; if functions -q -- $argv[1]; return 0; end; for p in (type -aP -- $argv[1] 2>/dev/null); if not _herdr_shim $p; return 0; end; end; return 1; end; for c in $argv[2..]; if _herdr_has $c; printf 'herdr-has:%s\\n' $c; end; end; printf '\\nherdr-check-complete\\n'";
+    in_shell(posix, fish, posix, commands.to_vec())
 }
 
 pub fn launch(command: Vec<String>) -> Vec<String> {

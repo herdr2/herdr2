@@ -9,7 +9,6 @@ pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
     ("antigravity", &["agy", "acp"]),
     ("claude", &["claude-agent-acp"]),
     ("codex", &["codex-acp"]),
-    ("gemini", &["gemini", "--acp"]),
     ("opencode", &["opencode", "acp"]),
     ("copilot", &["copilot", "--acp", "--stdio"]),
     ("cursor", &["cursor-agent", "acp"]),
@@ -856,17 +855,29 @@ fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
     if is_ide_shim_path(program) {
         return Err(shim_error(program));
     }
-    if !program.contains('/')
-        && !program.contains('\\')
-        && let Some(path) = std::env::var_os("PATH")
-    {
+    if program.contains('/') || program.contains('\\') {
+        let p = Path::new(program);
+        if p.exists() && is_ide_shim_candidate(p) {
+            return Err(shim_error(program));
+        }
+        return Ok(());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        let mut shim_hit: Option<std::path::PathBuf> = None;
         for dir in std::env::split_paths(&path) {
-            if let Some(cand) = candidate_files_in_dir(&dir, program, None).into_iter().find(|c| c.is_file()) {
-                if is_ide_shim_path(&cand.to_string_lossy()) {
-                    return Err(shim_error(&cand.display().to_string()));
+            for cand in candidate_files_in_dir(&dir, program, None) {
+                if !cand.is_file() {
+                    continue;
                 }
-                break;
+                if is_ide_shim_candidate(&cand) {
+                    shim_hit.get_or_insert(cand);
+                    continue;
+                }
+                return Ok(());
             }
+        }
+        if let Some(shim) = shim_hit {
+            return Err(shim_error(&shim.display().to_string()));
         }
     }
     Ok(())
@@ -874,7 +885,24 @@ fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
 
 pub(crate) fn is_ide_shim_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains(".windsurf") || lower.contains(".codeium")
+    if lower.contains(".windsurf") || lower.contains(".codeium") {
+        return true;
+    }
+    lower.split(['/', '\\']).any(|seg| seg == "copilot-shim")
+}
+
+/// Returns `true` when `path` itself, its symlink target, or its canonicalized path points into
+/// an IDE placeholder shim (such as VS Code's `copilot-shim` or Windsurf/Codeium wrappers).
+pub(crate) fn is_ide_shim_candidate(path: &Path) -> bool {
+    if is_ide_shim_path(&path.to_string_lossy()) {
+        return true;
+    }
+    if let Ok(link) = std::fs::read_link(path)
+        && is_ide_shim_path(&link.to_string_lossy())
+    {
+        return true;
+    }
+    path.canonicalize().ok().is_some_and(|resolved| is_ide_shim_path(&resolved.to_string_lossy()))
 }
 
 /// Resolves an executable in the supplied `PATH`/`PATHEXT` (or process environment) if it exists and is not an IDE shim.
@@ -892,14 +920,16 @@ pub(crate) fn resolve_non_shim_binary_in_path(
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
             return candidate_files_in_dir(dir, name, pathext_override)
                 .into_iter()
-                .find(|c| c.is_file() && !is_ide_shim_path(&c.to_string_lossy()));
+                .find(|c| c.is_file() && !is_ide_shim_candidate(c));
         }
-        return p.is_file().then(|| p.to_path_buf());
+        return (p.is_file() && !is_ide_shim_candidate(p)).then(|| p.to_path_buf());
     }
     let path = path_override.map(std::ffi::OsString::from).or_else(|| std::env::var_os("PATH"))?;
     for dir in std::env::split_paths(&path) {
-        if let Some(cand) = candidate_files_in_dir(&dir, program, pathext_override).into_iter().find(|c| c.is_file()) {
-            return (!is_ide_shim_path(&cand.to_string_lossy())).then_some(cand);
+        for cand in candidate_files_in_dir(&dir, program, pathext_override) {
+            if cand.is_file() && !is_ide_shim_candidate(&cand) {
+                return Some(cand);
+            }
         }
     }
     None
@@ -1091,14 +1121,53 @@ mod tests {
         assert_eq!(r.argv, ["my-claude-acp", "--fast"]);
         assert_eq!(r.prompt.as_deref(), Some("fix tests"));
 
-        let g = resolve(Some("gemini"), &[], Some("hi".into()), &BTreeMap::new()).unwrap();
-        assert_eq!(g.argv, ["gemini", "--acp"]);
-        assert_eq!(g.prompt.as_deref(), Some("hi"));
+        let q = resolve(Some("qwen"), &[], Some("hi".into()), &BTreeMap::new()).unwrap();
+        assert_eq!(q.preset.as_deref(), Some("qwen"));
+        assert_eq!(q.argv, ["qwen", "--acp"]);
+        assert_eq!(q.prompt.as_deref(), Some("hi"));
+        assert!(!BUILTIN_PRESETS.iter().any(|(name, _)| *name == "gemini"));
 
         let t = resolve(Some("trae"), &[], None, &BTreeMap::new()).unwrap();
         assert_eq!(t.preset.as_deref(), Some("trae"));
         assert_eq!(t.argv, ["traecli", "--acp"]);
         assert_eq!(fallback_acp_binaries(Some("trae"), "traecli"), &["traex", "trae-cli"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_vscode_copilot_shim_symlink_and_resolves_real_copilot_later_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("herdr2-copilot-shim-{}", crate::platform::random_hex()));
+        let usr_bin = root.join("usr/bin");
+        let shim_dir = root.join("usr/share/code/bin/copilot-shim");
+        let real_dir = root.join("local/bin");
+        std::fs::create_dir_all(&usr_bin).unwrap();
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let shim_bin = shim_dir.join("copilot");
+        std::fs::write(&shim_bin, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(&shim_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let usr_link = usr_bin.join("copilot");
+        std::os::unix::fs::symlink(&shim_bin, &usr_link).unwrap();
+
+        assert!(is_ide_shim_candidate(&usr_link));
+        assert_eq!(
+            resolve_non_shim_binary_in_path("copilot", Some(usr_bin.to_str().unwrap()), None),
+            None,
+            "VS Code copilot-shim symlink alone must not be detected as installed Copilot CLI"
+        );
+
+        let real_bin = real_dir.join("copilot");
+        std::fs::write(&real_bin, "#!/bin/sh\necho 1.0.0\n").unwrap();
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let combined = format!("{}:{}", usr_bin.display(), real_dir.display());
+        assert_eq!(
+            resolve_non_shim_binary_in_path("copilot", Some(&combined), None),
+            Some(real_bin),
+            "Real copilot later on PATH should still be resolved after skipping the shim"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

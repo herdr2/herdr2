@@ -3486,7 +3486,7 @@
             "type": "string"
           },
           "recommendedPreset": {
-            "description": "Recommended complementary target preset (e.g. `\"codex\"`, `\"claude\"`, `\"gemini\"`).",
+            "description": "Recommended complementary target preset (e.g. `\"codex\"`, `\"claude\"`, `\"agy\"`).",
             "type": "string"
           },
           "suggestedNote": {
@@ -6328,7 +6328,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.23"
+    "version": "2.0.24"
   },
   "methods": [
     {
@@ -6545,11 +6545,11 @@
       "paramStructure": "by-name",
       "params": [
         {
-          "description": "ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.",
+          "description": "ACP preset name (`claude`, `codex`, `agy`, ...) or explicit command line.",
           "name": "agent",
           "required": false,
           "schema": {
-            "description": "ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.",
+            "description": "ACP preset name (`claude`, `codex`, `agy`, ...) or explicit command line.",
             "type": [
               "string",
               "null"
@@ -8613,11 +8613,11 @@
           }
         },
         {
-          "description": "Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).",
+          "description": "Target preset/program (`claude`, `codex`, `agy`, ...).",
           "name": "preset",
           "required": false,
           "schema": {
-            "description": "Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).",
+            "description": "Target preset/program (`claude`, `codex`, `agy`, ...).",
             "type": [
               "string",
               "null"
@@ -12496,11 +12496,11 @@
           }
         },
         {
-          "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `gemini`, `opencode`).",
+          "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `agy`, `opencode`).",
           "name": "program",
           "required": false,
           "schema": {
-            "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `gemini`, `opencode`).",
+            "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `agy`, `opencode`).",
             "type": [
               "string",
               "null"

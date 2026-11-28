@@ -10,7 +10,7 @@
 
 ## Launch an ACP agent
 
-Built-in presets for `--agent` (or positional first argument): `claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, `trae`. Custom command lines work via `--agent "python3 my_acp.py"` or positional argv `h2 run -- python3 my_acp.py`.
+Built-in presets for `--agent` (or positional first argument): `agy`, `claude`, `codex`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, `trae`. Custom command lines work via `--agent "python3 my_acp.py"` or positional argv `h2 run -- python3 my_acp.py`.
 
 ```sh
 # Check reusable Markdown templates in ~/.config/herdr2/templates/*.md

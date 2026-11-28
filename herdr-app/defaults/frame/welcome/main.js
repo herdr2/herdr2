@@ -1703,8 +1703,8 @@ export default class Welcome extends View {
                     .text_color(t.muted)
                     .child(
                       this.tr(
-                        "No coding agents detected yet. Install Claude Code, Codex, Antigravity, Cursor, Gemini, OpenCode, or Pi on PATH, then click Re-detect.",
-                        "暂未检测到已安装的编程 Agent。安装 Claude Code、Codex、Antigravity、Cursor、Gemini、OpenCode 或 Pi 后点击「重新检测」。",
+                        "No coding agents detected yet. Install Claude Code, Codex, Antigravity, Cursor, OpenCode, or Pi on PATH, then click Re-detect.",
+                        "暂未检测到已安装的编程 Agent。安装 Claude Code、Codex、Antigravity、Cursor、OpenCode 或 Pi 后点击「重新检测」。",
                       ),
                     ),
                 ),

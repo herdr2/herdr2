@@ -14,7 +14,7 @@ function isPathLike(raw) {
 const AUTO_TAB_NAMES = new Set([
   "terminal", "终端", "shell", "zsh", "bash", "sh", "fish", "nu", "nushell", "dash",
   "pwsh", "powershell", "powershell 7", "windows powershell", "cmd", "command prompt", "git bash", "wsl", "dos prompt", "headless",
-  "claude", "claude code", "claude-code", "codex", "gemini", "antigravity", "agy", "agy.real",
+  "claude", "claude code", "claude-code", "codex", "antigravity", "agy", "agy.real",
   "opencode", "cursor", "cursor-agent", "pi", "pig", "qwen", "kimi", "kimi-code",
   "kiro", "kiro-cli", "qoder", "qodercli", "copilot", "github-copilot", "amp", "grok",
   "hermes", "goose", "crush", "omp", "oh-my-pi", "dsh", "dsh-tui", "deepseek", "deepseek harness",

@@ -187,7 +187,7 @@ function buildWorkSummary(p, term, isAgent, displayName) {
     const text = p.title && p.title !== displayName ? p.title : tr("Interactive terminal", "交互式终端");
     return { text, tone: "dim", tooltip: text };
   }
-  const st = p.status ?? term?.status ?? "idle";
+  const st = p.manual_status ?? term?.manual_status ?? p.status ?? term?.status ?? "idle";
   const manual = Boolean(p.manual_status || term?.manual_status);
   const permTitle = term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
   const micro = String(term?.micro_summary ?? p.micro_summary ?? "").trim();
@@ -198,7 +198,7 @@ function buildWorkSummary(p, term, isAgent, displayName) {
   let text = "";
   let tone = "muted";
   const semPrefix = semantic && semantic !== displayName ? `${semantic} · ` : "";
-  if (permTitle) {
+  if (permTitle && !manual) {
     text = tr(`Waiting approval: ${permTitle}`, `等待审批：${permTitle}`);
     tone = "blocked";
   } else if (micro) {

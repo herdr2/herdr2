@@ -224,23 +224,27 @@ fn claude_preset_defaults_to_dangerously_skip_permissions() {
 }
 
 #[test]
-fn agent_send_resets_manual_status_on_sender_and_receiver() {
+fn agent_send_preserves_manual_status_until_explicitly_cleared() {
     let s = Session::new();
     let a1 = run_fake(&s, &[]);
     let a2 = run_fake(&s, &[]);
 
-    s.json(&["label", &a1, "herdr.status=done@0"]);
-    s.json(&["label", &a2, "herdr.status=blocked@0"]);
-    assert_eq!(get(&s, &a1)["labels"]["herdr.status"], "done@0");
-    assert_eq!(get(&s, &a2)["labels"]["herdr.status"], "blocked@0");
+    s.json(&["label", &a1, "herdr.status=done"]);
+    s.json(&["label", &a2, "herdr.status=blocked"]);
+    assert_eq!(get(&s, &a1)["labels"]["herdr.status"], "done");
+    assert_eq!(get(&s, &a2)["labels"]["herdr.status"], "blocked");
 
     let send_out = s.cmd().env("H2_AGENT_ID", &a1).args(["send", &a2, "--wait", "PING"]).output().unwrap();
     assert!(send_out.status.success(), "{}", String::from_utf8_lossy(&send_out.stderr));
 
     let after_a1 = get(&s, &a1);
     let after_a2 = get(&s, &a2);
-    assert!(after_a1["labels"].get("herdr.status").is_none(), "sender manual status was not reset: {after_a1}");
-    assert!(after_a2["labels"].get("herdr.status").is_none(), "receiver manual status was not reset: {after_a2}");
+    assert_eq!(after_a1["labels"]["herdr.status"], "done", "sender manual status must remain pinned: {after_a1}");
+    assert_eq!(after_a2["labels"]["herdr.status"], "blocked", "receiver manual status must remain pinned: {after_a2}");
+
+    // Explicit clearing restores auto mode.
+    s.json(&["label", &a1, "herdr.status="]);
+    assert!(get(&s, &a1)["labels"].get("herdr.status").is_none());
 }
 
 #[test]

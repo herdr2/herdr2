@@ -806,8 +806,6 @@ async fn handoff_into_existing(
             }
 
             let sent = core.pty_send(dst_id, &pointer, false, None).await?;
-            core.clear_manual_status_key(TargetKey::Terminal(dst_id));
-            core.clear_manual_status_caller(p.caller.as_deref());
 
             let wait_res = if p.wait {
                 if sent.started == Some(false) {

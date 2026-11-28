@@ -207,7 +207,7 @@ pub struct StopResult {
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
 pub struct RunParams {
-    /// ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.
+    /// ACP preset name (`claude`, `codex`, `agy`, ...) or explicit command line.
     #[arg(long, value_name = "AGENT")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -1310,7 +1310,7 @@ pub struct HandoffParams {
     #[arg(long, value_enum, default_value_t = crate::handoff::LineageKind::Handoff)]
     #[serde(default)]
     pub kind: crate::handoff::LineageKind,
-    /// Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).
+    /// Target preset/program (`claude`, `codex`, `agy`, ...).
     #[arg(long, value_name = "AGENT")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,

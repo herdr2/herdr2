@@ -728,8 +728,8 @@ impl Model {
         if a.word == word {
             return false;
         }
-        let was_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
-        let was_busy = matches!(a.word.as_deref(), Some("working" | "blocked"));
+        let prev_word = a.word.clone();
+        let was_busy = matches!(prev_word.as_deref(), Some("working" | "blocked"));
         match word.as_deref() {
             Some("working" | "blocked") => a.seen = true,
             // A finish you didn't watch is "done" until you look at it.
@@ -737,12 +737,15 @@ impl Model {
             _ => {}
         }
         a.word = word;
-        let now_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
+        if a.manual_status.is_some() {
+            return false;
+        }
         self.seq += 1;
         a.seq = self.seq;
         let now = now_ms();
         a.since = now;
-        a.transition_timing(was_eff.as_deref(), now_eff.as_deref(), now);
+        let next_word = a.word.clone();
+        a.transition_timing(prev_word.as_deref(), next_word.as_deref(), now);
         true
     }
 
@@ -1517,10 +1520,20 @@ mod tests {
 
         assert!(m.set_manual_status("t1", Some("done".into()), None));
         assert_eq!(m.status("t1"), Some("done"));
+        let pinned_seq = m.agents["t1"].seq;
+        let pinned_since = m.agents["t1"].since;
         // Marking seen does not clear an explicit manual "done" override.
         m.mark_seen(&["t1".into()]);
         assert_eq!(m.status("t1"), Some("done"));
         assert_eq!(m.alert_for("t1", false, Some("working"), Some("idle"), false), None);
+
+        // Subsequent automatic status words must not alter the displayed status, order, or timestamp.
+        assert!(!m.set_word("t1", Some("blocked".into()), Some("claude".into()), false));
+        assert_eq!(m.status("t1"), Some("done"));
+        assert_eq!(m.agents["t1"].seq, pinned_seq);
+        assert_eq!(m.agents["t1"].since, pinned_since);
+        assert!(!m.set_word("t1", Some("working".into()), Some("claude".into()), true));
+        assert_eq!(m.status("t1"), Some("done"));
 
         assert!(m.set_manual_status("t1", Some("idle".into()), None));
         assert_eq!(m.status("t1"), Some("idle"));

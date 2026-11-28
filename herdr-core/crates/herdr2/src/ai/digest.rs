@@ -421,7 +421,7 @@ fn is_auto_program_label(lower: &str) -> bool {
         lower,
         "terminal" | "shell" | "zsh" | "bash" | "sh" | "fish" | "nu" | "nushell" | "dash"
             | "pwsh" | "powershell" | "powershell 7" | "windows powershell" | "cmd"
-            | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "gemini-cli"
+            | "claude" | "claude code" | "claude-code" | "codex"
             | "antigravity" | "agy" | "agy.real" | "opencode" | "cursor" | "cursor-agent"
             | "pi" | "omp" | "oh-my-pi" | "kimi" | "kimi-code" | "qwen" | "qwen-code"
             | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot"

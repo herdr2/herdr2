@@ -68,7 +68,7 @@ More
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
-Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode, trae.
+Built-in `--agent` presets: agy, claude, codex, cursor, dsh, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode, trae.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (Windows: %APPDATA%\herdr2\config.toml) (default_permissions, inject_mcp, [agents]).
@@ -1451,7 +1451,7 @@ Options:
           [default: handoff]
 
       --preset <AGENT>
-          Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...)
+          Target preset/program (`claude`, `codex`, `agy`, ...)
 
       --pty
           Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`)
@@ -1915,7 +1915,7 @@ Arguments:
   [ARGV]...  Preset/command and arguments, or a template name and its task
 
 Options:
-      --agent <AGENT>                 ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line
+      --agent <AGENT>                 ACP preset name (`claude`, `codex`, `agy`, ...) or explicit command line
       --json                          JSON output even in a terminal
       --prompt <TEXT>                 Initial prompt queued right after ACP session setup
       --system-prompt <TEXT>          System prompt appended via `_meta.systemPrompt` on session creation
@@ -2084,7 +2084,7 @@ Options:
       --all              Install into all detected agent skill directories
       --json             JSON output even in a terminal
       --detected-only    Only install into agents actually detected on disk/PATH (do not create fallback dirs)
-      --agent <AGENT>    Target a specific known agent ID (e.g. claude, codex, agy, cursor, gemini, opencode, hermes, zcode, trae, qoder, ...)
+      --agent <AGENT>    Target a specific known agent ID (e.g. claude, codex, agy, cursor, opencode, hermes, zcode, trae, qoder, ...)
       --target <DIR>     Target a custom skills root directory
       --skills <SKILLS>  Comma-separated subset of skills to install (default: all bundled skills)
       --on <MACHINE>     Target remote machine (`h2 machine ls`)

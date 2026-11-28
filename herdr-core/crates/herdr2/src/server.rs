@@ -506,10 +506,6 @@ async fn handle(
     };
     let call = api::Call { core, conn, plain };
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
-    if matches!(method, "agent.send" | "terminal.send" | "terminal.keys" | "agent.approve" | "agent.deny") {
-        core.clear_manual_status_caller(params["from"].as_str());
-        core.clear_manual_status_caller(params["caller"].as_str());
-    }
     let result = match crate::remote::route(core, method, &params) {
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
         Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {

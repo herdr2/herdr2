@@ -158,6 +158,13 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
     let base_env = crate::platform::program_env().await;
     let mut changed = false;
 
+    let target_ids: BTreeSet<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+    let before_len = snap.agents.len();
+    snap.agents.retain(|a| target_ids.contains(&a.id));
+    if snap.agents.len() != before_len {
+        changed = true;
+    }
+
     for (id, base_argv) in targets {
         let resolved = resolve_probe_command(&id, &base_argv, &base_env);
         let now_installed = resolved.is_some();
@@ -186,9 +193,12 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
                     snap.full_probe = false;
                     changed = true;
                 }
-            } else if was_installed && !now_installed && existing.error.is_some() {
-                existing.error = None;
-                changed = true;
+            } else if was_installed && !now_installed {
+                if existing.error.is_some() || !existing.models.is_empty() {
+                    existing.error = None;
+                    existing.models.clear();
+                    changed = true;
+                }
             }
         } else {
             let (models, default_model) = discover_local_models(&id, now_installed, &base_env);
@@ -1313,21 +1323,6 @@ pub(crate) fn discover_local_models_in_homes(
                 "claude-sonnet-5-5-low",
                 "gpt-oss-120b-medium",
             ] {
-                push_unique(&mut models, curated);
-            }
-        }
-        "gemini" => {
-            for home in homes {
-                if let Ok(text) = std::fs::read_to_string(home.join(".gemini/settings.json"))
-                    && let Ok(val) = serde_json::from_str::<Value>(&text)
-                    && let Some(m) =
-                        val["model"].as_str().or_else(|| val["model"]["name"].as_str()).filter(|s| !s.is_empty())
-                {
-                    default_model.get_or_insert_with(|| m.to_string());
-                    push_unique(&mut models, m);
-                }
-            }
-            for curated in ["gemini-2.5-pro", "gemini-2.5-flash"] {
                 push_unique(&mut models, curated);
             }
         }

@@ -8,7 +8,7 @@ const tr = (en, zh) => (isZh() ? zh : en);
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
 const MODE_KEY = "new-menu.agent-mode";
-const ACP_PRESETS = new Set(["claude", "codex", "antigravity", "agy", "gemini", "opencode", "copilot", "cursor", "kimi", "qwen", "pi", "hermes", "glm", "zcode", "trae", "dsh-tui", "dsh"]);
+const ACP_PRESETS = new Set(["claude", "codex", "antigravity", "agy", "opencode", "copilot", "cursor", "kimi", "qwen", "pi", "hermes", "glm", "zcode", "trae", "dsh-tui", "dsh"]);
 const ACP_AGENT_KEY = { antigravity: "agy", "dsh-tui": "dsh" };
 const WIN_SHELLS = () => [
   { id: "powershell", label: "PowerShell" },

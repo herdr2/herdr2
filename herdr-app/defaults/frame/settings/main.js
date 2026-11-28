@@ -38,7 +38,7 @@ const DROVE_DEFAULT_ROLE_SUMMARIES_EN = {
   "只读异构代码审查、并发安全与架构审计": "Read-only cross-model code review, concurrency safety, and architecture audits",
   "跨仓源码检索、架构摸底与日志分析": "Cross-repo code search, architecture discovery, and log analysis",
 };
-const DROVE_FALLBACK_AGENTS = ["claude", "codex", "agy", "gemini", "opencode", "qoder", "cursor", "kimi", "dsh"];
+const DROVE_FALLBACK_AGENTS = ["claude", "codex", "agy", "opencode", "qoder", "cursor", "kimi", "dsh"];
 const DROVE_EFFORTS = ["low", "medium", "high", "xhigh"];
 const DROVE_ROLE_STRENGTH_PRESETS = {
   coder: [
@@ -102,7 +102,6 @@ const DROVE_AGENT_ICONS = {
   antigravity: { path: "icons/antigravity.svg", tint: false },
   claude: { path: "icons/claude.svg", tint: false },
   codex: { path: "icons/codex.svg", tint: false },
-  gemini: { path: "icons/gemini.svg", tint: true },
   opencode: { path: "icons/opencode.svg", tint: true },
   cursor: { path: "icons/cursor.svg", tint: true },
   "cursor-agent": { path: "icons/cursor.svg", tint: true },
@@ -169,17 +168,6 @@ const SUPPORTED_AGENTS_CATALOG = [
       argv: ["sh", "-c", "curl https://cursor.com/install -fsS | bash"],
       winArgv: ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm 'https://cursor.com/install?win32=true' | iex"],
       display: "curl https://cursor.com/install -fsS | bash",
-    },
-  },
-  {
-    id: "gemini",
-    name: "Gemini CLI",
-    cli: "gemini",
-    acpMode: "builtin",
-    acpCommand: "gemini --acp",
-    install: {
-      argv: ["npm", "install", "-g", "@google/gemini-cli"],
-      display: "npm install -g @google/gemini-cli",
     },
   },
   {
@@ -2558,13 +2546,6 @@ export default class Settings extends View {
           hintEn: "Run `kimi login` in a terminal to sign in",
           hintZh: "在终端运行 `kimi login` 完成登录",
         };
-      case "gemini":
-        return {
-          argv: ["gemini"],
-          display: "gemini",
-          hintEn: "Run `gemini` in a terminal to sign in or configure API key",
-          hintZh: "在终端运行 `gemini` 完成登录或配置 API Key",
-        };
       case "qwen":
         return {
           argv: ["qwen"],
@@ -2777,8 +2758,8 @@ export default class Settings extends View {
           notify({
             title: this.tr("No installed AI agent available", "当前主机未检测到可用的 AI Agent"),
             body: this.tr(
-              "Install one CLI agent first (for example Claude Code, Codex, or Gemini CLI using the Install button) to enable AI-assisted setup.",
-              "请先使用「一键安装」安装至少一个 CLI Agent（如 Claude Code、Codex 或 Gemini CLI），之后即可由 AI 协助安装其他智能体。",
+              "Install one CLI agent first (for example Claude Code, Codex, or Antigravity using the Install button) to enable AI-assisted setup.",
+              "请先使用「一键安装」安装至少一个 CLI Agent（如 Claude Code、Codex 或 Antigravity），之后即可由 AI 协助安装其他智能体。",
             ),
             level: "error",
           });
@@ -2972,7 +2953,6 @@ export default class Settings extends View {
       codex: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
       cursor: ["cursor-agent", "--yolo", "--trust"],
       opencode: ["opencode", "--auto"],
-      gemini: ["gemini", "--yolo"],
       kimi: ["kimi", "--auto"],
       hermes: ["hermes", "--yolo", "--accept-hooks"],
       zcode: ["zcode", "--mode", "yolo"],
@@ -2999,7 +2979,6 @@ export default class Settings extends View {
       "codex",
       "cursor",
       "opencode",
-      "gemini",
       "hermes",
       "zcode",
       "kimi",
@@ -3246,7 +3225,7 @@ export default class Settings extends View {
   }
 
   async resolveFixAgentLaunch(targetMachine, readyAgents, preferredAgentId = null) {
-    const prefOrder = ["claude", "agy", "codex", "cursor", "opencode", "gemini", "hermes", "zcode", "kimi", "copilot", "qoder", "dsh"];
+    const prefOrder = ["claude", "agy", "codex", "cursor", "opencode", "hermes", "zcode", "kimi", "copilot", "qoder", "dsh"];
     const want = this.canonicalFixAgentId(preferredAgentId);
     const machineKey = targetMachine ?? "__local__";
     let knownList = null;
@@ -10100,8 +10079,8 @@ export default class Settings extends View {
           notify({
             title: this.tr("No local CLI AI agent found", "未找到本机可用的 AI Agent"),
             body: this.tr(
-              "Install at least one local CLI agent (e.g. claude, agy, codex, gemini, opencode) to use AI Update.",
-              "请先在本机安装至少一个可用的 CLI AI Agent（如 claude、agy、codex、gemini、opencode）后再使用 AI 更新。",
+              "Install at least one local CLI agent (e.g. claude, agy, codex, opencode) to use AI Update.",
+              "请先在本机安装至少一个可用的 CLI AI Agent（如 claude、agy、codex、opencode）后再使用 AI 更新。",
             ),
             level: "error",
           });

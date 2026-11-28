@@ -493,8 +493,8 @@ export default class Agents extends View {
       ? ` · ${aiKind === "error" ? tr("Error", "异常") : "AI"}: ${aiSummary}`
       : "";
     const tip = tr(
-      `Status: ${label}${a.manual_status ? " (manual)" : ""}${aiTag} — click to change`,
-      `状态：${label}${a.manual_status ? "（手动）" : ""}${aiTag} — 点击更改`,
+      `Status: ${label}${a.manual_status ? " (manual · auto-detect paused)" : ""}${aiTag} — click to change`,
+      `状态：${label}${a.manual_status ? "（手动锁定，已暂停自动检测）" : ""}${aiTag} — 点击更改`,
     );
     const active = this.hovered === addr || this.hoveredSub === addr || Boolean(a.manual_status);
     const btn = h_flex()

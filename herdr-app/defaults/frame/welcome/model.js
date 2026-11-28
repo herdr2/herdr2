@@ -320,7 +320,6 @@ const AGENT_DISPLAY_NAMES = {
   codex: "Codex",
   agy: "Antigravity",
   cursor: "Cursor",
-  gemini: "Gemini CLI",
   opencode: "OpenCode",
   pi: "Pi",
   kimi: "Kimi",
@@ -338,7 +337,7 @@ const AGENT_DISPLAY_NAMES = {
 };
 
 const AGENT_PREF_ORDER = [
-  "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi",
+  "claude", "codex", "agy", "cursor", "opencode", "pi",
   "kimi", "copilot", "hermes", "zcode", "trae", "qwen", "glm", "dsh", "qoder", "kiro", "amp", "grok",
 ];
 
